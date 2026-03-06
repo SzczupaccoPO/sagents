@@ -247,6 +247,7 @@ defmodule Sagents.AgentServer do
       :middleware_registry,
       :presence_config,
       :conversation_id,
+      :tenant_id,
       # Module implementing Sagents.AgentPersistence, or nil
       :agent_persistence,
       # Module implementing Sagents.DisplayMessagePersistence, or nil
@@ -284,6 +285,7 @@ defmodule Sagents.AgentServer do
               }
               | nil,
             conversation_id: String.t() | nil,
+            tenant_id: String.t() | nil,
             agent_persistence: module() | nil,
             display_message_persistence: module() | nil,
             presence_module: module() | nil,
@@ -1281,6 +1283,9 @@ defmodule Sagents.AgentServer do
     # Extract conversation_id from opts
     conversation_id = Keyword.get(opts, :conversation_id)
 
+    # Extract tenant_id from opts
+    tenant_id = Keyword.get(opts, :tenant_id)
+
     # Extract persistence behaviour modules
     agent_persistence = Keyword.get(opts, :agent_persistence)
     display_message_persistence = Keyword.get(opts, :display_message_persistence)
@@ -1306,6 +1311,7 @@ defmodule Sagents.AgentServer do
       middleware_registry: middleware_registry,
       presence_config: presence_config,
       conversation_id: conversation_id,
+      tenant_id: tenant_id,
       agent_persistence: agent_persistence,
       display_message_persistence: display_message_persistence,
       presence_module: presence_module,
@@ -2342,7 +2348,7 @@ defmodule Sagents.AgentServer do
       module = server_state.display_message_persistence
 
       try do
-        case module.save_message(server_state.conversation_id, message) do
+        case module.save_message(server_state.conversation_id, server_state.tenant_id, message) do
           {:ok, display_messages} when is_list(display_messages) ->
             Enum.each(display_messages, fn display_msg ->
               broadcast_event(server_state, {:display_message_saved, display_msg})

@@ -308,6 +308,7 @@ defmodule Sagents.AgentSupervisor do
     shutdown_delay = Keyword.get(config, :shutdown_delay, 5000)
     presence_tracking = Keyword.get(config, :presence_tracking)
     conversation_id = Keyword.get(config, :conversation_id)
+    tenant_id = Keyword.get(config, :tenant_id)
     agent_persistence = Keyword.get(config, :agent_persistence)
     display_message_persistence = Keyword.get(config, :display_message_persistence)
     presence_module = Keyword.get(config, :presence_module)
@@ -343,6 +344,11 @@ defmodule Sagents.AgentSupervisor do
     agent_server_opts =
       if conversation_id,
         do: Keyword.put(agent_server_opts, :conversation_id, conversation_id),
+        else: agent_server_opts
+
+    agent_server_opts =
+      if tenant_id,
+        do: Keyword.put(agent_server_opts, :tenant_id, tenant_id),
         else: agent_server_opts
 
     # Add agent_persistence if provided

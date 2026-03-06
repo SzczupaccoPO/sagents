@@ -67,7 +67,7 @@ defmodule Sagents.DisplayMessagePersistence do
   - `{:ok, [saved_messages]}` — List of persisted display message records
   - `{:error, reason}` — Persistence failed (logged, does not affect agent)
   """
-  @callback save_message(conversation_id :: String.t(), message :: LangChain.Message.t()) ::
+  @callback save_message(conversation_id :: String.t(), tenant_id :: String.t(), message :: LangChain.Message.t()) ::
               {:ok, list()} | {:error, term()}
 
   @type tool_status :: :executing | :completed | :failed | :interrupted

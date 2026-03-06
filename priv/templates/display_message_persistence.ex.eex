@@ -15,7 +15,7 @@ defmodule <%= module %> do
   alias LangChain.Message
 
   @impl true
-  def save_message(conversation_id, %Message{} = message) do
+  def save_message(conversation_id, tenant_id, %Message{} = message) do
     display_items = DisplayHelpers.extract_display_items(message)
 
     if Enum.empty?(display_items) do
@@ -36,7 +36,7 @@ defmodule <%= module %> do
             attrs
           end
 
-        case <%= conversations_module %>.append_display_message(conversation_id, attrs) do
+        case <%= conversations_module %>.append_display_message(conversation_id, tenant_id, attrs) do
           {:ok, display_msg} ->
             {:cont, {:ok, acc ++ [display_msg]}}
 
