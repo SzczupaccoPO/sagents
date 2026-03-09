@@ -14,7 +14,7 @@ defmodule Sagents.TestDisplayMessagePersistence do
   end
 
   @impl true
-  def update_tool_status(_status, _tool_info) do
+  def update_tool_status(_status, _tool_info, _tenant_id) do
     {:error, :not_found}
   end
 end
@@ -32,7 +32,7 @@ defmodule Sagents.TestDisplayMessagePersistenceRaising do
   end
 
   @impl true
-  def update_tool_status(_status, _tool_info) do
+  def update_tool_status(_status, _tool_info, _tenant_id) do
     {:error, :not_found}
   end
 end
@@ -59,7 +59,7 @@ defmodule Sagents.TestDisplayMessagePersistenceForwarding do
   end
 
   @impl true
-  def update_tool_status(_status, _tool_info) do
+  def update_tool_status(_status, _tool_info, _tenant_id) do
     {:error, :not_found}
   end
 end

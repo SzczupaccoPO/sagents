@@ -95,7 +95,7 @@ defmodule Sagents.DisplayMessagePersistence do
   - `{:ok, updated_message}` — Updated record, broadcast to LiveViews as `{:display_message_updated, msg}`
   - `{:error, :not_found}` — No matching tool call exists (normal if persistence wasn't configured when call was saved)
   """
-  @callback update_tool_status(status :: tool_status(), tool_info :: map()) ::
+  @callback update_tool_status(status :: tool_status(), tool_info :: map(), tenant_id :: binary()) ::
               {:ok, term()} | {:error, :not_found | term()}
 
   @doc """

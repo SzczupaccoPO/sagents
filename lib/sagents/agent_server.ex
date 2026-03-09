@@ -2271,7 +2271,7 @@ defmodule Sagents.AgentServer do
 
     # Persist if configured
     if server_state.display_message_persistence do
-      case server_state.display_message_persistence.update_tool_status(status, tool_info) do
+      case server_state.display_message_persistence.update_tool_status(status, tool_info, server_state.tenant_id) do
         {:ok, updated_msg} ->
           broadcast_event(server_state, {:display_message_updated, updated_msg})
 
@@ -2332,7 +2332,7 @@ defmodule Sagents.AgentServer do
     module = server_state.display_message_persistence
 
     if module && function_exported?(module, :resolve_tool_result, 2) do
-      case module.resolve_tool_result(tool_call_id, result_content) do
+      case module.resolve_tool_result(tool_call_id, result_content, server_state.tenant_id) do
         {:ok, updated_msg} ->
           broadcast_event(server_state, {:display_message_updated, updated_msg})
 
