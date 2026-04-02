@@ -155,22 +155,45 @@ defmodule Sagents.Middleware do
   @callback after_model(State.t(), middleware_config) :: middleware_result()
 
   @doc """
-  Handle asynchronous messages sent to this middleware.
+  Handle messages sent to this middleware.
 
-  Middleware can spawn async tasks that send messages back to the AgentServer using
-  `send(server_pid, {:middleware_message, middleware_id, message})`. When such messages
-  are received, they are routed to this callback.
+  Messages are routed to a specific middleware by ID through the AgentServer's
+  middleware registry. Any process can send a targeted message to a middleware
+  using `AgentServer.notify_middleware/3`.
 
-  This enables patterns like:
-  - Spawning background processing tasks
-  - Receiving results from async operations
-  - Updating state based on external events
+  This enables two primary patterns:
+
+  ### 1. External notifications
+
+  LiveViews, controllers, or other processes can send context updates to a
+  running middleware. The middleware updates state metadata, which `before_model/2`
+  reads on the next LLM call.
+
+      # In a LiveView — user switched to editing a different blog post
+      AgentServer.notify_middleware(agent_id, MyApp.UserContext, {:post_changed, %{
+        slug: "/blog/getting-started-with-elixir",
+        title: "Getting Started with Elixir"
+      }})
+
+      # In the middleware
+      def handle_message({:post_changed, post_info}, state, _config) do
+        {:ok, State.put_metadata(state, "current_post", post_info)}
+      end
+
+  ### 2. Async task results
+
+  Middleware that spawns background tasks sends results back to itself for
+  state updates.
+
+      def handle_message({:title_generated, title}, state, _config) do
+        {:ok, State.put_metadata(state, "conversation_title", title)}
+      end
 
   Defaults to `{:ok, state}` if not implemented.
 
   ## Parameters
 
-  - `message` - The message payload sent from the async task
+  - `message` - The message payload (any term — typically a tagged tuple)
   - `state` - The current `Sagents.State` struct
   - `config` - The middleware configuration from `init/1`
 
@@ -178,18 +201,6 @@ defmodule Sagents.Middleware do
 
   - `{:ok, updated_state}` - Success with potentially modified state
   - `{:error, reason}` - Failure (logged but does not halt agent execution)
-
-  ## Example
-
-      def handle_message({:title_generated, title}, state, _config) do
-        updated_state = State.put_metadata(state, "conversation_title", title)
-        {:ok, updated_state}
-      end
-
-      def handle_message({:title_generation_failed, reason}, state, _config) do
-        Logger.warning("Title generation failed: \#{inspect(reason)}")
-        {:ok, state}
-      end
   """
   @callback handle_message(message :: term(), State.t(), middleware_config) ::
               {:ok, State.t()}
@@ -297,6 +308,40 @@ defmodule Sagents.Middleware do
   """
   @callback callbacks(middleware_config) :: map()
 
+  @doc """
+  Handle a resume after an interrupt.
+
+  Called by `Sagents.Agent.resume/3` to give each middleware a chance to claim and handle
+  an interrupt. The middleware should pattern-match on `state.interrupt_data` to
+  decide whether the interrupt belongs to it.
+
+  ## Return Values
+
+  - `{:cont, state}` - "Not mine, pass to next middleware." Default when not implemented.
+  - `{:ok, updated_state}` - "Handled. State is ready for re-execution." Halts the chain.
+  - `{:interrupt, state, new_interrupt_data}` - "Handled, but needs another round." Halts the chain.
+  - `{:error, reason}` - "Handled, but invalid." Halts the chain.
+
+  ## Parameters
+
+  - `agent` - The `Sagents.Agent` struct
+  - `state` - The current `Sagents.State` struct (with interrupt_data set)
+  - `resume_data` - The data provided by the caller to resume execution (polymorphic)
+  - `config` - The middleware configuration from `init/1`
+  - `opts` - Options from `Sagents.Agent.resume/3` (includes `:callbacks` for LLMChain event handlers)
+  """
+  @callback handle_resume(
+              Sagents.Agent.t(),
+              State.t(),
+              resume_data :: term(),
+              middleware_config(),
+              opts :: keyword()
+            ) ::
+              {:ok, State.t()}
+              | {:cont, State.t()}
+              | {:interrupt, State.t(), interrupt_data :: map()}
+              | {:error, term()}
+
   @optional_callbacks [
     init: 1,
     system_prompt: 1,
@@ -306,7 +351,8 @@ defmodule Sagents.Middleware do
     handle_message: 3,
     state_schema: 0,
     on_server_start: 2,
-    callbacks: 1
+    callbacks: 1,
+    handle_resume: 5
   ]
 
   @doc """
@@ -524,6 +570,54 @@ defmodule Sagents.Middleware do
       module.on_server_start(state, config)
     rescue
       UndefinedFunctionError -> {:ok, state}
+    end
+  end
+
+  @doc """
+  Apply handle_resume callback from middleware.
+
+  Returns `{:cont, state}` if the middleware does not implement the callback,
+  allowing the next middleware in the stack to try.
+
+  ## Parameters
+
+  - `agent` - The Agent struct
+  - `state` - The current agent state (with interrupt_data)
+  - `resume_data` - The polymorphic resume data from the caller
+  - `entry` - MiddlewareEntry struct with module and config
+
+  ## Returns
+
+  - `{:cont, state}` - Middleware does not handle this interrupt
+  - `{:ok, updated_state}` - Interrupt handled, state ready for re-execution
+  - `{:interrupt, state, new_interrupt_data}` - Handled but needs another round
+  - `{:error, reason}` - Handled but invalid
+  """
+  @spec apply_handle_resume(
+          Sagents.Agent.t(),
+          State.t(),
+          term(),
+          Sagents.MiddlewareEntry.t(),
+          keyword()
+        ) ::
+          {:ok, State.t()}
+          | {:cont, State.t()}
+          | {:interrupt, State.t(), map()}
+          | {:error, term()}
+  def apply_handle_resume(
+        agent,
+        state,
+        resume_data,
+        %MiddlewareEntry{
+          module: module,
+          config: config
+        },
+        opts \\ []
+      ) do
+    try do
+      module.handle_resume(agent, state, resume_data, config, opts)
+    rescue
+      UndefinedFunctionError -> {:cont, state}
     end
   end
 end

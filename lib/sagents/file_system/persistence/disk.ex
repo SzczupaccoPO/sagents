@@ -47,7 +47,9 @@ defmodule Sagents.FileSystem.Persistence.Disk do
   ## Storage Options
 
   - `:path` - Base directory for file storage (required)
-  - `:base_directory` - Virtual directory name (automatically added by FileSystemConfig)
+  - `:base_directory` - Virtual directory name (automatically added by FileSystemConfig).
+    Not present for default configs (`default: true`), in which case files are stored
+    directly under the storage path without any directory prefix stripping.
 
   ## File Organization
 
@@ -73,6 +75,19 @@ defmodule Sagents.FileSystem.Persistence.Disk do
   alias Sagents.FileSystem.FileMetadata
 
   @impl true
+  def write_to_storage(%FileEntry{entry_type: :directory, path: path} = entry, opts) do
+    # Directories are persisted as actual directories on disk
+    full_path = build_file_path(path, opts)
+
+    case File.mkdir_p(full_path) do
+      :ok ->
+        {:ok, FileEntry.mark_clean(entry)}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   def write_to_storage(%FileEntry{path: path, content: content} = entry, opts) do
     full_path = build_file_path(path, opts)
 
@@ -90,7 +105,7 @@ defmodule Sagents.FileSystem.Persistence.Disk do
       metadata = %{metadata | created_at: stat.ctime, modified_at: stat.mtime}
 
       # Return FileEntry with updated metadata and marked as clean
-      updated_entry = %{entry | metadata: metadata, dirty: false, loaded: true}
+      updated_entry = FileEntry.mark_clean(%{entry | metadata: metadata, loaded: true})
       {:ok, updated_entry}
     end
   end
@@ -115,7 +130,9 @@ defmodule Sagents.FileSystem.Persistence.Disk do
       metadata = %{metadata | created_at: stat.ctime, modified_at: stat.mtime}
 
       # Return FileEntry with content and metadata
-      loaded_entry = %{entry | content: content, metadata: metadata, loaded: true, dirty: false}
+      loaded_entry =
+        FileEntry.mark_clean(%{entry | content: content, metadata: metadata, loaded: true})
+
       {:ok, loaded_entry}
     end
   end
@@ -132,14 +149,32 @@ defmodule Sagents.FileSystem.Persistence.Disk do
   end
 
   @impl true
-  def list_persisted_files(_agent_id, opts) do
+  def move_in_storage(%FileEntry{path: old_path} = entry, new_path, opts) do
+    old_full_path = build_file_path(old_path, opts)
+    new_full_path = build_file_path(new_path, opts)
+
+    with :ok <- File.mkdir_p(Path.dirname(new_full_path)),
+         :ok <- File.rename(old_full_path, new_full_path) do
+      {:ok, %{entry | path: new_path}}
+    end
+  end
+
+  @impl true
+  def list_persisted_entries(_agent_id, opts) do
     storage_path = Keyword.fetch!(opts, :path)
     base_directory = Keyword.get(opts, :base_directory, "")
 
     case File.exists?(storage_path) do
       true ->
-        files = scan_directory(storage_path, storage_path, base_directory)
-        {:ok, files}
+        paths = scan_directory(storage_path, storage_path, base_directory)
+
+        entries =
+          Enum.map(paths, fn path ->
+            {:ok, entry} = FileEntry.new_indexed_file(path)
+            entry
+          end)
+
+        {:ok, entries}
 
       false ->
         {:ok, []}

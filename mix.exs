@@ -2,7 +2,7 @@ defmodule Sagents.MixProject do
   use Mix.Project
 
   @source_url "https://github.com/sagents-ai/sagents"
-  @version "0.3.0"
+  @version "0.4.3"
 
   def project do
     [
@@ -43,12 +43,13 @@ defmodule Sagents.MixProject do
   defp deps do
     [
       # Core dependency - the LangChain library
-      {:langchain, "~> 0.6.1"},
+      {:langchain, "~> 0.6.3"},
       # {:langchain, path: "../my_langchain"},
 
       # Required dependencies
       {:phoenix_pubsub, "~> 2.1"},
       {:ecto, "~> 3.10 or ~> 3.11"},
+      {:jason, "~> 1.0"},
 
       # Optional dependencies
       {:phoenix, "~> 1.7", optional: true},
@@ -157,7 +158,8 @@ defmodule Sagents.MixProject do
       "docs/middleware.md",
       "docs/middleware_messaging.md",
       "docs/observability.md",
-      "docs/persistence.md"
+      "docs/persistence.md",
+      "docs/filesystem_setup.md"
     ]
   end
 

@@ -252,6 +252,8 @@ defmodule Sagents.AgentServer do
       :agent_persistence,
       # Module implementing Sagents.DisplayMessagePersistence, or nil
       :display_message_persistence,
+      # Module implementing Sagents.MessagePreprocessor, or nil
+      :message_preprocessor,
       # Presence module for agent discovery (e.g., MyApp.Presence)
       # When set, agent tracks presence on "agent_server:presence" topic
       :presence_module,
@@ -288,6 +290,7 @@ defmodule Sagents.AgentServer do
             tenant_id: String.t() | nil,
             agent_persistence: module() | nil,
             display_message_persistence: module() | nil,
+            message_preprocessor: module() | nil,
             presence_module: module() | nil,
             restored: boolean()
           }
@@ -418,12 +421,63 @@ defmodule Sagents.AgentServer do
   end
 
   @doc """
-  Send the AgentServer a message intended to be processed by a middleware
-  handler. This is a mechanism for a middleware to send itself a message, as any
-  message processed by a middleware must be designed to be handled.
+  Send a targeted message to a specific middleware in a running AgentServer.
+
+  The message is routed through the middleware registry and delivered to the
+  middleware's `handle_message/3` callback. The middleware is identified by its
+  ID (module name by default, or a custom string if configured via `:id` option).
+
+  This is a fire-and-forget operation — the caller does not wait for a response.
+  If the AgentServer is not running, the message is silently dropped.
+
+  ## Use Cases
+
+  There are two primary use cases for this function:
+
+  ### 1. External notifications (LiveViews, controllers, other processes)
+
+  Send context updates or configuration changes to a middleware from outside the
+  agent system. The middleware decides how to handle the message — typically by
+  updating state metadata that `before_model/2` reads on the next LLM call.
+
+      # LiveView: user switched to editing a different blog post
+      AgentServer.notify_middleware(agent_id, MyApp.UserContext, {:post_changed, %{
+        slug: "/blog/getting-started-with-elixir",
+        title: "Getting Started with Elixir"
+      }})
+
+      # Controller: user changed a preference
+      AgentServer.notify_middleware(agent_id, MyApp.Preferences, {:preference_changed, :verbose, true})
+
+  ### 2. Async task results (middleware sending messages to itself)
+
+  Middleware that spawns background tasks (e.g., title generation, embedding
+  computation) uses this to send results back to the AgentServer for state updates.
+
+      # Inside an async task spawned by the middleware
+      AgentServer.notify_middleware(agent_id, middleware_id, {:title_generated, title})
+
+  ## Parameters
+
+  - `agent_id` - The agent identifier (used to locate the AgentServer process)
+  - `middleware_id` - The middleware ID to route the message to (module name or custom string)
+  - `message` - Any term to be delivered to the middleware's `handle_message/3` callback
+
+  ## Returns
+
+  - `:ok` — always returns `:ok`, even if the AgentServer is not running
+
+  ## Examples
+
+      # Notify by module name (default middleware ID)
+      AgentServer.notify_middleware("conv-123", MyApp.Middleware.UserContext, {:post_changed, post})
+
+      # Notify by custom ID (when middleware was configured with `id: "english_title"`)
+      AgentServer.notify_middleware("conv-123", "english_title", {:regenerate, %{}})
+
   """
-  @spec send_middleware_message(String.t(), term(), term()) :: :ok
-  def send_middleware_message(agent_id, middleware_id, message) do
+  @spec notify_middleware(String.t(), term(), term()) :: :ok
+  def notify_middleware(agent_id, middleware_id, message) do
     agent_id
     |> get_pid()
     |> case do
@@ -434,6 +488,17 @@ defmodule Sagents.AgentServer do
       _other ->
         :ok
     end
+  end
+
+  @doc """
+  Deprecated: Use `notify_middleware/3` instead.
+
+  This is an alias for `notify_middleware/3` retained for backwards compatibility.
+  """
+  @deprecated "Use `Sagents.AgentServer.notify_middleware/3` instead."
+  @spec send_middleware_message(String.t(), term(), term()) :: :ok
+  def send_middleware_message(agent_id, middleware_id, message) do
+    notify_middleware(agent_id, middleware_id, message)
   end
 
   @doc """
@@ -777,26 +842,30 @@ defmodule Sagents.AgentServer do
   end
 
   @doc """
-  Resume agent execution after a human-in-the-loop interrupt.
+  Resume agent execution after an interrupt.
 
   ## Parameters
 
   - `agent_id` - The agent identifier
-  - `decisions` - List of decision maps from human reviewer (see `Sagents.Agent.resume/3`)
+  - `resume_data` - Data to resume with (polymorphic per middleware).
+    For HITL: list of decision maps. For AskUserQuestion: response map.
 
   ## Examples
 
+      # HITL resume
       decisions = [
         %{type: :approve},
         %{type: :edit, arguments: %{"path" => "safe.txt"}},
         %{type: :reject}
       ]
-
       :ok = AgentServer.resume("my-agent-1", decisions)
+
+      # AskUserQuestion resume
+      :ok = AgentServer.resume("my-agent-1", %{type: :answer, selected: ["PostgreSQL"]})
   """
-  @spec resume(String.t(), list(map())) :: :ok | {:error, term()}
-  def resume(agent_id, decisions) when is_list(decisions) do
-    GenServer.call(get_name(agent_id), {:resume, decisions}, :infinity)
+  @spec resume(String.t(), term()) :: :ok | {:error, term()}
+  def resume(agent_id, resume_data) do
+    GenServer.call(get_name(agent_id), {:resume, resume_data}, :infinity)
   end
 
   # The `get_state/1` function is available to aid in testing and not intended as a general public API.
@@ -1290,6 +1359,9 @@ defmodule Sagents.AgentServer do
     agent_persistence = Keyword.get(opts, :agent_persistence)
     display_message_persistence = Keyword.get(opts, :display_message_persistence)
 
+    # Extract message preprocessor module
+    message_preprocessor = Keyword.get(opts, :message_preprocessor)
+
     # Extract presence module for agent discovery
     # When set, agent will track presence on "agent_server:presence" topic
     presence_module = Keyword.get(opts, :presence_module)
@@ -1314,6 +1386,7 @@ defmodule Sagents.AgentServer do
       tenant_id: tenant_id,
       agent_persistence: agent_persistence,
       display_message_persistence: display_message_persistence,
+      message_preprocessor: message_preprocessor,
       presence_module: presence_module,
       restored: Keyword.get(opts, :restored, false)
     }
@@ -1442,7 +1515,15 @@ defmodule Sagents.AgentServer do
   end
 
   @impl true
-  def handle_call({:resume, decisions}, _from, %ServerState{status: :interrupted} = server_state) do
+  def handle_call(
+        {:resume, resume_data},
+        _from,
+        %ServerState{status: :interrupted} = server_state
+      ) do
+    # Capture interrupt_data before clearing -- resume_agent needs it for
+    # display message updates (e.g., marking ask_user tools as completed).
+    resolved_interrupt_data = server_state.interrupt_data
+
     # Transition back to running
     new_state = %{
       server_state
@@ -1459,14 +1540,14 @@ defmodule Sagents.AgentServer do
     # Resume execution async (callbacks are built in resume_agent)
     task =
       Task.async(fn ->
-        resume_agent(new_state, decisions)
+        resume_agent(new_state, resume_data, resolved_interrupt_data)
       end)
 
     {:reply, :ok, Map.put(new_state, :task, task)}
   end
 
   @impl true
-  def handle_call({:resume, _decisions}, _from, server_state) do
+  def handle_call({:resume, _resume_data}, _from, server_state) do
     {:reply, {:error, "Cannot resume, server is not interrupted"}, server_state}
   end
 
@@ -1511,38 +1592,45 @@ defmodule Sagents.AgentServer do
 
   @impl true
   def handle_call({:add_message, message}, _from, server_state) do
-    # Add message to the state
-    new_state = State.add_message(server_state.state, message)
+    # Run message preprocessor if configured (splits into display + LLM versions)
+    case run_message_preprocessor(server_state, message) do
+      {:ok, display_message, llm_message} ->
+        # Add LLM message to the state
+        new_state = State.add_message(server_state.state, llm_message)
 
-    # Transition to idle if we were completed/error/cancelled to allow new execution
-    new_status =
-      case server_state.status do
-        :completed -> :idle
-        :error -> :idle
-        :cancelled -> :idle
-        status -> status
-      end
+        # Transition to idle if we were completed/error/cancelled to allow new execution
+        new_status =
+          case server_state.status do
+            :completed -> :idle
+            :error -> :idle
+            :cancelled -> :idle
+            status -> status
+          end
 
-    updated_server_state = %{
-      server_state
-      | state: new_state,
-        status: new_status,
-        error: nil
-    }
+        updated_server_state = %{
+          server_state
+          | state: new_state,
+            status: new_status,
+            error: nil
+        }
 
-    # Reset inactivity timer on user message
-    updated_server_state = reset_inactivity_timer(updated_server_state)
+        # Reset inactivity timer on user message
+        updated_server_state = reset_inactivity_timer(updated_server_state)
 
-    # Save and broadcast messages immediately
-    # Note: During LLM execution, assistant messages are also saved via on_message_processed callback
-    # But if manually adding assistant messages, we should also save them here
-    maybe_save_and_broadcast_message(updated_server_state, message)
+        # Save and broadcast the display message
+        # Note: During LLM execution, assistant messages are also saved via on_message_processed callback
+        # But if manually adding assistant messages, we should also save them here
+        maybe_save_and_broadcast_message(updated_server_state, display_message)
 
-    # Note: Debug event for user messages is NOT broadcast here.
-    # The authoritative state (with potential middleware modifications)
-    # will be broadcast via on_after_middleware callback when Agent.execute runs.
+        # Note: Debug event for user messages is NOT broadcast here.
+        # The authoritative state (with potential middleware modifications)
+        # will be broadcast via on_after_middleware callback when Agent.execute runs.
 
-    {:reply, :ok, updated_server_state}
+        {:reply, :ok, updated_server_state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, server_state}
+    end
   end
 
   @impl true
@@ -2039,7 +2127,7 @@ defmodule Sagents.AgentServer do
       # BEFORE the main agent continues execution. This ensures the UI updates
       # the tool call status in real-time rather than waiting for the full LLM cycle.
       on_subagent_resolved: fn interrupt_data, status ->
-        maybe_update_subagent_tool_display(server_state, interrupt_data, status)
+        maybe_update_interrupt_tool_display(server_state, interrupt_data, status)
       end
     }
   end
@@ -2074,16 +2162,19 @@ defmodule Sagents.AgentServer do
     end
   end
 
-  defp resume_agent(server_state, decisions) do
+  defp resume_agent(server_state, resume_data, resolved_interrupt_data) do
+    # For interrupt types that resolve via State.replace_tool_result (not LLMChain
+    # re-execution), fire the display update explicitly here. HITL tools get their
+    # completion callbacks through LLMChain.execute_tool_calls_with_decisions, so
+    # they are NOT included here to avoid double-updating.
+    maybe_resolve_interrupt_display_on_resume(server_state, resolved_interrupt_data)
+
     # Same callback assembly as execute_agent/2
     pubsub_callbacks = build_pubsub_callbacks(server_state)
     middleware_callbacks = Middleware.collect_callbacks(server_state.agent.middleware)
     callbacks = [pubsub_callbacks | middleware_callbacks]
 
-    # Note: Sub-agent tool display updates happen via on_subagent_resolved callback
-    # fired from Agent.resume_subagent_hitl BEFORE the main agent continues execution.
-    # This ensures real-time UI updates rather than waiting for the full LLM cycle.
-    case Agent.resume(server_state.agent, server_state.state, decisions, callbacks: callbacks) do
+    case Agent.resume(server_state.agent, server_state.state, resume_data, callbacks: callbacks) do
       {:ok, new_state} ->
         broadcast_state_changes(server_state, new_state)
         {:ok, new_state}
@@ -2145,7 +2236,7 @@ defmodule Sagents.AgentServer do
     }
 
     # Update sub-agent tool call display message to "interrupted"
-    maybe_update_subagent_tool_display(updated_state, interrupt_data, :interrupted)
+    maybe_update_interrupt_tool_display(updated_state, interrupt_data, :interrupted)
 
     # Persist agent state on interrupt
     maybe_persist_state(updated_state, :on_interrupt)
@@ -2281,8 +2372,11 @@ defmodule Sagents.AgentServer do
     end
   end
 
-  # Update the display message for a sub-agent tool call on interrupt/resume
-  defp maybe_update_subagent_tool_display(
+  # Update the display message for interrupted tool calls on interrupt/resume.
+  # Handles subagent HITL, ask_user questions, and multiple_interrupts.
+
+  # --- SubAgent HITL ---
+  defp maybe_update_interrupt_tool_display(
          server_state,
          %{type: :subagent_hitl, tool_call_id: tool_call_id},
          :interrupted
@@ -2293,7 +2387,7 @@ defmodule Sagents.AgentServer do
     })
   end
 
-  defp maybe_update_subagent_tool_display(
+  defp maybe_update_interrupt_tool_display(
          server_state,
          %{type: :subagent_hitl, tool_call_id: tool_call_id},
          :completed
@@ -2305,11 +2399,10 @@ defmodule Sagents.AgentServer do
       display_text: "Task completed"
     })
 
-    # Also resolve the interrupted tool result display message
     maybe_resolve_tool_result(server_state, tool_call_id, "Task completed")
   end
 
-  defp maybe_update_subagent_tool_display(
+  defp maybe_update_interrupt_tool_display(
          server_state,
          %{type: :subagent_hitl, tool_call_id: tool_call_id},
          :failed
@@ -2320,12 +2413,65 @@ defmodule Sagents.AgentServer do
       error: "Task failed"
     })
 
-    # Also resolve the interrupted tool result display message
     maybe_resolve_tool_result(server_state, tool_call_id, "Task failed")
   end
 
-  # Not a sub-agent interrupt — no tool display update needed
-  defp maybe_update_subagent_tool_display(_server_state, _interrupt_data, _status), do: :ok
+  # --- AskUserQuestion ---
+  defp maybe_update_interrupt_tool_display(
+         server_state,
+         %{type: :ask_user_question, tool_call_id: tool_call_id},
+         :interrupted
+       ) do
+    broadcast_tool_event(server_state, :interrupted, %{
+      call_id: tool_call_id,
+      display_text: "Waiting for user response"
+    })
+  end
+
+  defp maybe_update_interrupt_tool_display(
+         server_state,
+         %{type: :ask_user_question, tool_call_id: tool_call_id},
+         :completed
+       ) do
+    broadcast_tool_event(server_state, :completed, %{
+      call_id: tool_call_id,
+      name: "ask_user",
+      result: "Question answered"
+    })
+
+    maybe_resolve_tool_result(server_state, tool_call_id, "Question answered")
+  end
+
+  # --- Multiple interrupts: update each inner interrupt ---
+  defp maybe_update_interrupt_tool_display(
+         server_state,
+         %{type: :multiple_interrupts, interrupts: interrupts},
+         status
+       ) do
+    Enum.each(interrupts, fn interrupt ->
+      maybe_update_interrupt_tool_display(server_state, interrupt, status)
+    end)
+  end
+
+  # Not a recognized interrupt type -- no tool display update needed
+  defp maybe_update_interrupt_tool_display(_server_state, _interrupt_data, _status), do: :ok
+
+  # Fire display updates on resume for interrupt types that DON'T go through
+  # LLMChain tool re-execution (and thus don't fire on_tool_execution_completed).
+  defp maybe_resolve_interrupt_display_on_resume(server_state, %{type: :ask_user_question} = data) do
+    maybe_update_interrupt_tool_display(server_state, data, :completed)
+  end
+
+  defp maybe_resolve_interrupt_display_on_resume(server_state, %{
+         type: :multiple_interrupts,
+         interrupts: interrupts
+       }) do
+    Enum.each(interrupts, fn interrupt ->
+      maybe_resolve_interrupt_display_on_resume(server_state, interrupt)
+    end)
+  end
+
+  defp maybe_resolve_interrupt_display_on_resume(_server_state, _interrupt_data), do: :ok
 
   # Resolve the interrupted tool result display message if the persistence module supports it
   defp maybe_resolve_tool_result(%ServerState{} = server_state, tool_call_id, result_content) do
@@ -2339,6 +2485,32 @@ defmodule Sagents.AgentServer do
         {:error, _} ->
           :ok
       end
+    end
+  end
+
+  # Run message preprocessor if configured, splitting message into display and LLM versions.
+  # Returns {:ok, display_message, llm_message} or {:error, reason}.
+  defp run_message_preprocessor(%ServerState{message_preprocessor: nil}, message) do
+    {:ok, message, message}
+  end
+
+  defp run_message_preprocessor(%ServerState{} = server_state, message) do
+    context = %{
+      agent_id: server_state.agent.agent_id,
+      conversation_id: server_state.conversation_id,
+      tool_context: server_state.agent.tool_context,
+      state: server_state.state
+    }
+
+    try do
+      server_state.message_preprocessor.preprocess(message, context)
+    rescue
+      exception ->
+        Logger.error(
+          "Message preprocessor raised exception: #{inspect(exception)}\n#{Exception.format_stacktrace(__STACKTRACE__)}"
+        )
+
+        {:error, {:preprocessor_error, exception}}
     end
   end
 

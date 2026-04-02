@@ -1,5 +1,106 @@
 # Changelog
 
+## v0.4.3
+
+Introduces a generalized interrupt/resume system via the new `handle_resume/5` middleware callback, replacing the hardcoded HITL resume logic in `Agent.resume/3`. Also adds `AskUserQuestion` middleware for structured user prompts with typed question and response data.
+
+### Added
+- `handle_resume/5` optional callback on `Middleware` behaviour -- gives each middleware a chance to claim and resolve interrupts during `Agent.resume/3`, replacing the previous monolithic resume handler [#45](https://github.com/sagents-ai/sagents/pull/45)
+- `Middleware.apply_handle_resume/5` helper -- safely invokes `handle_resume/5` with `UndefinedFunctionError` rescue for middleware that don't implement it [#45](https://github.com/sagents-ai/sagents/pull/45)
+- `AskUserQuestion` middleware -- provides an `ask_user` tool for structured questions with typed response formats (`:single_select`, `:multi_select`, `:freeform`), option lists, `allow_other`, and `allow_cancel` fields [#45](https://github.com/sagents-ai/sagents/pull/45)
+- `handle_resume/5` implementation on `HumanInTheLoop` -- moves existing HITL decision processing (approve/reject/edit, tool execution, sub-agent forwarding) into the middleware callback pattern [#45](https://github.com/sagents-ai/sagents/pull/45)
+- `handle_resume/5` implementation on `SubAgent` -- handles sub-agent HITL interrupt forwarding and resolution [#45](https://github.com/sagents-ai/sagents/pull/45)
+- Re-scan mechanism in `Agent.resume/3` -- when a middleware returns `{:cont}` with new `interrupt_data` on state, the middleware stack is re-scanned with `resume_data = nil` so the owning middleware can claim it [#45](https://github.com/sagents-ai/sagents/pull/45)
+- `Agent.build_chain/4` exposed as public for middleware that need to rebuild the LLMChain during resume (e.g., HITL tool execution) [#45](https://github.com/sagents-ai/sagents/pull/45)
+- Display message handling for `ask_user` interrupts in `AgentServer` -- broadcasts `:interrupted`/`:completed` tool events for UI updates [#45](https://github.com/sagents-ai/sagents/pull/45)
+- AskUserQuestion added to default middleware stack in generator template (`factory.ex.eex`) [#45](https://github.com/sagents-ai/sagents/pull/45)
+- LiveView helper template (`agent_live_helpers.ex.eex`) updated with question response handling, `agent_id` nil-guards, and interrupt type dispatch [#45](https://github.com/sagents-ai/sagents/pull/45)
+- Documentation for `handle_resume/5`, tool-level interrupts, claim vs resolve pattern, re-scan mechanism, and middleware ordering in `docs/middleware.md` [#45](https://github.com/sagents-ai/sagents/pull/45)
+
+### Changed
+- `Agent.resume/3` replaced ~230 lines of hardcoded HITL/sub-agent resume logic with a generic middleware cycle via `apply_handle_resume_hooks/5` [#45](https://github.com/sagents-ai/sagents/pull/45)
+- `AgentServer.resume/2` accepts polymorphic `resume_data` instead of requiring a `list(map())` of decisions [#45](https://github.com/sagents-ai/sagents/pull/45)
+- `AgentServer` renamed `maybe_update_subagent_tool_display/3` to `maybe_update_interrupt_tool_display/3` to reflect support for multiple interrupt types [#45](https://github.com/sagents-ai/sagents/pull/45)
+
+## v0.4.2
+
+### Added
+- `move_in_storage/3` implementation on `Persistence.Disk` -- files and directories are now renamed on the host filesystem via `File.rename/2` when `move_file` is used, with automatic parent directory creation [#43](https://github.com/sagents-ai/sagents/pull/43)
+- Cross-persistence backend validation on `move_file/3` -- moves between different storage backends (e.g., disk to database) are rejected with an error message that includes the source `base_directory` so the agent knows the valid move scope [#43](https://github.com/sagents-ai/sagents/pull/43)
+- Read-only destination check on `move_file/3` -- moving files into a read-only directory now returns an error (previously only the source was checked) [#43](https://github.com/sagents-ai/sagents/pull/43)
+
+### Fixed
+- `FileSystemState.list_files/1` now filters out directory entries, returning only file paths. Previously, directory `FileEntry` items were included in the result, causing downstream callers to treat directories as files [#43](https://github.com/sagents-ai/sagents/pull/43)
+
+## v0.4.1
+
+### Added
+- `move_file` tool on FileSystem middleware, allowing agents to move or rename files and directories through the tool interface. Delegates to `FileSystemServer.move_file/3`. [#41](https://github.com/sagents-ai/sagents/pull/41)
+
+## v0.4.0
+
+Major FileSystem API expansion with directory entries, richer FileEntry struct, file move/rename, metadata-only persistence optimization, and a clearer API surface. Also adds `tool_context` for caller-supplied data in tools, `MessagePreprocessor` for display/LLM message splitting, and improved middleware messaging.
+
+**Breaking changes** — see Upgrading section below.
+
+### Upgrading from v0.3.1
+
+**FileEntry field renames:**
+- `FileEntry.dirty` → `FileEntry.dirty_content`
+- `FileEntry.dirty_metadata` → `FileEntry.dirty_non_content`
+
+**API renames:**
+- `FileSystemState.update_metadata/4` → `update_custom_metadata/4` (no longer accepts `:title` opt — use `update_entry/4` for title changes)
+- `FileSystemServer.update_metadata/4` → `update_custom_metadata/4`
+- `Persistence.list_persisted_files/2` → `list_persisted_entries/2` (now returns `[%FileEntry{}]` instead of `[path_string]`)
+
+**Return type changes:**
+- `FileSystemServer.write_file/4` returns `{:ok, %FileEntry{}}` instead of `:ok`
+- `FileSystemServer.read_file/2` returns `{:ok, %FileEntry{}}` instead of `{:ok, content_string}`
+- `FileSystemState.write_file/4` returns `{:ok, entry, state}` instead of `{:ok, state}`
+
+### Added
+- Directory entries as first-class `FileEntry` with `entry_type: :directory`, automatic `mkdir -p` ancestor creation, and `new_directory/2` constructor [#34](https://github.com/sagents-ai/sagents/pull/34)
+- `title`, `id`, and `file_type` fields on `FileEntry` for richer file metadata [#34](https://github.com/sagents-ai/sagents/pull/34)
+- `FileEntry.update_entry_changeset/2` — changeset for safe entry-level field updates (title, id, file_type) [#39](https://github.com/sagents-ai/sagents/pull/39)
+- `update_entry/4` on `FileSystemState` and `FileSystemServer` — updates entry-level fields via changeset [#39](https://github.com/sagents-ai/sagents/pull/39)
+- `update_custom_metadata/4` on `FileSystemState` and `FileSystemServer` — replaces `update_metadata/4` with a clearer name scoped to `metadata.custom` [#39](https://github.com/sagents-ai/sagents/pull/39)
+- `list_entries/1` on `FileSystemState` and `FileSystemServer` — returns all entries with synthesized directories for tree UIs [#34](https://github.com/sagents-ai/sagents/pull/34)
+- `create_directory/3` on `FileSystemState` and `FileSystemServer` [#34](https://github.com/sagents-ai/sagents/pull/34)
+- `move_file/3` on `FileSystemState` and `FileSystemServer` — atomically moves a file or directory (and its children) to a new path, re-keying entries and transferring debounce timers [#39](https://github.com/sagents-ai/sagents/pull/39)
+- `move_in_storage/3` optional callback on `Persistence` behaviour — persistence backends can implement this to handle path changes efficiently [#39](https://github.com/sagents-ai/sagents/pull/39)
+- `update_metadata_in_storage/2` optional callback on `Persistence` behaviour — efficient metadata-only updates without rewriting file content [#38](https://github.com/sagents-ai/sagents/pull/38)
+- `dirty_non_content` flag on `FileEntry` — tracks non-content changes separately from content changes, enabling metadata-only persistence optimization [#38](https://github.com/sagents-ai/sagents/pull/38), [#39](https://github.com/sagents-ai/sagents/pull/39)
+- `persist_file/2` routes to `update_metadata_in_storage` when only non-content fields changed and the backend supports it, falling back to `write_to_storage` otherwise [#38](https://github.com/sagents-ai/sagents/pull/38)
+- `default: true` option on `FileSystemConfig` — catch-all config for path-agnostic persistence backends (e.g. database), specific configs take priority [#33](https://github.com/sagents-ai/sagents/pull/33)
+- Configurable `entry_to_map` option on FileSystem middleware — controls how entries are serialized to JSON for LLM tool results, with `default_entry_to_map/1` fallback [#34](https://github.com/sagents-ai/sagents/pull/34)
+- `tool_context` field on `Agent` — caller-supplied map (user IDs, tenant info, scopes) merged into `LLMChain.custom_context` for tool functions [#35](https://github.com/sagents-ai/sagents/pull/35)
+- `Sagents.MessagePreprocessor` behaviour — intercepts messages in AgentServer to produce separate display and LLM versions, enabling rich reference expansion (e.g. `@ProjectBrief` → full content for LLM, styled chip for UI) [#37](https://github.com/sagents-ai/sagents/pull/37)
+- `notify_middleware/3` on `AgentServer` — renamed from `send_middleware_message/3` to better reflect its general-purpose notification role (deprecated wrapper retained for backwards compatibility) [#36](https://github.com/sagents-ai/sagents/pull/36)
+- FileSystem setup guide documentation [#32](https://github.com/sagents-ai/sagents/pull/32)
+- Middleware messaging documentation rewrite covering external notification and async task patterns [#36](https://github.com/sagents-ai/sagents/pull/36)
+
+### Changed
+- **BREAKING:** `FileEntry.dirty` field renamed to `dirty_content` [#39](https://github.com/sagents-ai/sagents/pull/39)
+- **BREAKING:** `update_metadata/4` renamed to `update_custom_metadata/4` on both `FileSystemState` and `FileSystemServer` [#39](https://github.com/sagents-ai/sagents/pull/39)
+- **BREAKING:** `FileSystemServer.write_file/4` returns `{:ok, %FileEntry{}}` instead of `:ok` [#34](https://github.com/sagents-ai/sagents/pull/34)
+- **BREAKING:** `FileSystemServer.read_file/2` returns `{:ok, %FileEntry{}}` instead of `{:ok, content_string}` [#34](https://github.com/sagents-ai/sagents/pull/34)
+- **BREAKING:** `FileSystemState.write_file/4` returns `{:ok, entry, state}` instead of `{:ok, state}` [#34](https://github.com/sagents-ai/sagents/pull/34)
+- **BREAKING:** `Persistence.list_persisted_files/2` renamed to `list_persisted_entries/2`, returns `[%FileEntry{}]` instead of `[path_string]` [#34](https://github.com/sagents-ai/sagents/pull/34)
+- Non-content updates (`update_custom_metadata`, `update_entry`) persist immediately by default; pass `persist: :debounce` to opt into debounced persistence [#39](https://github.com/sagents-ai/sagents/pull/39)
+- New persisted files persist immediately on creation; only subsequent content updates are debounced [#34](https://github.com/sagents-ai/sagents/pull/34)
+- FileSystem middleware `ls` tool now returns JSON array of entry maps instead of path strings [#34](https://github.com/sagents-ai/sagents/pull/34)
+- Updated code generator templates to thread `tool_context` and `message_preprocessor` through Coordinator and Factory [#35](https://github.com/sagents-ai/sagents/pull/35), [#37](https://github.com/sagents-ai/sagents/pull/37)
+- Documentation examples updated to use latest Anthropic model names [#32](https://github.com/sagents-ai/sagents/pull/32)
+
+### Fixed
+- `FileEntry.update_content/3` now resets `dirty_non_content` to `false`, preventing a data loss scenario where a metadata update followed by a content write would incorrectly route to `update_metadata_in_storage` and lose the content change [#38](https://github.com/sagents-ai/sagents/pull/38)
+
+## v0.3.1
+
+### Fixed
+- Horde dependency is now truly optional. Projects using the default `:local` distribution mode no longer require `:horde` to be installed for compilation to succeed. Previously, `use Horde.Registry` and `use Horde.DynamicSupervisor` in the Horde implementation modules caused compile-time failures even when Horde was declared as optional [#27](https://github.com/sagents-ai/sagents/issues/27)
+
 ## v0.3.0
 
 Adds structured agent completion (`until_tool`), interruptible tools for improved HITL workflows, middleware-based observability callbacks, and custom execution modes. Requires LangChain `~> 0.6.1`.

@@ -15,7 +15,7 @@ defmodule Sagents.Middleware.HumanInTheLoopIntegrationTest do
 
   defp create_test_model do
     ChatAnthropic.new!(%{
-      model: "claude-3-5-sonnet-20241022",
+      model: "claude-sonnet-4-6",
       temperature: 0,
       stream: false
     })
@@ -450,7 +450,7 @@ defmodule Sagents.Middleware.HumanInTheLoopIntegrationTest do
       decisions = [%{type: :approve}]
 
       assert {:error, reason} = Agent.resume(agent, state, decisions)
-      assert reason =~ "Unknown interrupt type"
+      assert reason =~ "No middleware handled the resume"
     end
 
     @tag :live_call
