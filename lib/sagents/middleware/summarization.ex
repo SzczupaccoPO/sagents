@@ -132,6 +132,7 @@ defmodule Sagents.Middleware.Summarization do
   @default_max_tokens 170_000
   @default_messages_to_keep 6
   @search_range_for_tool_pairs 5
+  @threshold_count 0
 
   @default_summary_prompt """
   You are a Context Extraction Assistant. Your objective is to extract the highest quality and most relevant context from the conversation history below.
@@ -160,7 +161,8 @@ defmodule Sagents.Middleware.Summarization do
         Keyword.get(opts, :max_tokens_before_summary, @default_max_tokens),
       messages_to_keep: Keyword.get(opts, :messages_to_keep, @default_messages_to_keep),
       summary_prompt: Keyword.get(opts, :summary_prompt, @default_summary_prompt),
-      token_counter: Keyword.get(opts, :token_counter, &count_tokens_approximately/1)
+      token_counter: Keyword.get(opts, :token_counter, &count_tokens_approximately/1),
+      threshold_count: Keyword.get(opts, :threshold_count, @threshold_count)
     }
 
     {:ok, config}
@@ -326,7 +328,7 @@ defmodule Sagents.Middleware.Summarization do
         SummarizeConversationChain.new!(%{
           llm: model,
           keep_count: 0,
-          threshold_count: 0,
+          threshold_count: config.threshold_count,
           override_system_prompt: config.summary_prompt
         })
 
