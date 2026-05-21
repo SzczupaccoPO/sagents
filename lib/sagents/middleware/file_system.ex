@@ -1,14 +1,14 @@
 defmodule Sagents.Middleware.FileSystem do
   @moduledoc """
-  Middleware that adds mock filesystem capabilities to agents.
+  Middleware that adds virtual filesystem capabilities to agents.
 
-  Provides tools for file operations in an isolated, in-memory filesystem:
-  - `ls`: List all files (with optional pattern filtering)
+  Provides tools for file operations in an isolated, persistable filesystem:
+  - `list_files`: List all files (with optional pattern filtering)
   - `read_file`: Read file contents with line numbers and pagination
-  - `write_file`: Create or overwrite files
-  - `edit_file`: Make targeted edits with string replacement
-  - `search_text`: Search for text patterns within files or across all files
-  - `edit_lines`: Replace a range of lines by line number
+  - `create_file`: Create new files (errors if file exists)
+  - `replace_file_text`: Make targeted edits with string replacement
+  - `replace_file_lines`: Replace a range of lines by line number
+  - `find_in_file`: Find text or regex matches within a single file
   - `delete_file`: Delete files from the filesystem
   - `move_file`: Move or rename files and directories
 
@@ -25,12 +25,14 @@ defmodule Sagents.Middleware.FileSystem do
 
   ### Basic Configuration
 
-  - `:long_term_memory` - Enable persistence (default: false)
-  - `:memories_prefix` - Path prefix for long-term persisted files (default: "memories")
+  - `:filesystem_scope` - Scope tuple identifying the filesystem (e.g. `{:agent, id}`,
+    `{:user, id}`, `{:project, id}`)
   - `:enabled_tools` - List of tool names to enable (default: all tools)
   - `:custom_tool_descriptions` - Map of custom descriptions per tool
-  - `:entry_to_map` - Function that converts a `FileEntry` to a JSON-friendly map for LLM
-    tool results (default: `&Sagents.Middleware.FileSystem.default_entry_to_map/1`)
+  - `:custom_display_texts` - Map of custom `display_text` labels (per tool)
+    shown in the UI when the tool runs. Useful when a consuming project wants
+    user-facing language different from the defaults (e.g. `"Writing document"`
+    instead of `"Creating file"`).
 
   ### Selective Tool Enabling
 
@@ -39,11 +41,12 @@ defmodule Sagents.Middleware.FileSystem do
       {:ok, agent} = Agent.new(
         model: model,
         filesystem_opts: [
-          enabled_tools: ["ls", "read_file"]  # Read-only, no write/edit
+          enabled_tools: ["list_files", "read_file"]  # Read-only
         ]
       )
 
-  Available tools: `"ls"`, `"read_file"`, `"write_file"`, `"edit_file"`, `"search_text"`, `"edit_lines"`, `"delete_file"`, `"move_file"`
+  Available tools: `"list_files"`, `"read_file"`, `"create_file"`, `"replace_file_text"`,
+  `"replace_file_lines"`, `"find_in_file"`, `"delete_file"`, `"move_file"`
 
   ### Custom Tool Descriptions
 
@@ -54,83 +57,44 @@ defmodule Sagents.Middleware.FileSystem do
         filesystem_opts: [
           custom_tool_descriptions: %{
             "read_file" => "Custom description for reading files...",
-            "write_file" => "Custom description for writing files..."
+            "create_file" => "Custom description for creating files..."
           }
         ]
       )
 
-  ### Custom Entry-to-Map Function
+  ### Custom Display Texts
 
-  The `entry_to_map` option controls how `FileEntry` structs are serialized to
-  JSON maps in LLM tool results (used by `ls`, `write_file`, etc.). The default
-  implementation returns path, title, entry_type, file_type, persistence, size,
-  and id (when present). Override it to include application-specific fields:
+  Override the default UI label shown when a tool runs. Only the tools you
+  specify are overridden; the rest keep their defaults.
 
-      {Sagents.Middleware.FileSystem, [
-        filesystem_scope: {:project, project_id},
-        entry_to_map: fn %FileEntry{} = entry ->
-          Sagents.Middleware.FileSystem.default_entry_to_map(entry)
-          |> Map.put(:genre, entry.metadata && entry.metadata.custom["genre"])
-          |> Sagents.Middleware.FileSystem.maybe_add_field(:tags, entry.metadata && entry.metadata.custom["tags"])
-        end
-      ]}
-
-  ### Persistence Configuration
-
-  Provide persistence callbacks to save/load files from external storage:
-
-      # Module-based (implement Sagents.FilesystemCallbacks)
       {:ok, agent} = Agent.new(
         model: model,
         filesystem_opts: [
-          persistence: MyApp.FilesystemPersistence,
-          context: %{user_id: user_id}
+          custom_display_texts: %{
+            "create_file" => "Writing document",
+            "delete_file" => "Removing document"
+          }
         ]
       )
-
-      # Function-based (inline callbacks)
-      {:ok, agent} = Agent.new(
-        model: model,
-        filesystem_opts: [
-          on_write: fn file_path, content, ctx ->
-            MyApp.Files.save(ctx.user_id, file_path, content)
-          end,
-          on_read: fn file_path, ctx ->
-            MyApp.Files.get(ctx.user_id, file_path)
-          end,
-          context: %{user_id: user_id}
-        ]
-      )
-
-  ### Persistence Options
-
-  - `:persistence` - Module implementing FilesystemCallbacks behavior
-  - `:on_write` - Function for write operations `fn(path, content, ctx) -> result`
-  - `:on_read` - Function for read operations `fn(path, ctx) -> {:ok, content} | {:error, reason}`
-  - `:on_delete` - Function for delete operations `fn(path, ctx) -> result`
-  - `:on_list` - Function for list operations `fn(ctx) -> {:ok, [paths]} | {:error, reason}`
-  - `:context` - Map passed to all callbacks (user_id, session_id, etc.)
-  - `:cache_reads` - Cache reads in memory (default: true)
-  - `:fail_on_persistence_error` - Fail operations if persistence fails (default: false)
 
   ## File Organization
 
   Use hierarchical paths to organize files:
 
-      write_file(file_path: "Chapter 1/summary.md", content: "...")
-      write_file(file_path: "images/diagram.png", content: "...")
-      ls(pattern: "Chapter 1/*")
+      create_file(file_path: "/reports/q1-summary.md", content: "...")
+      create_file(file_path: "/images/diagram.png", content: "...")
+      list_files(pattern: "/reports/*")
 
   ## Pattern Filtering
 
-  The `ls` tool supports wildcard patterns:
+  The `list_files` tool supports wildcard patterns:
   - `*` matches any characters
-  - Examples: `*summary*`, `*.md`, `Chapter 1/*`
+  - Examples: `*summary*`, `*.md`, `reports/*`
 
   ## Path Security
 
   Paths are validated to prevent security issues:
-  - Paths starting with "/" are rejected (system path protection)
+  - Paths must start with "/"
   - Path traversal attempts ("..") are rejected
   - Home directory shortcuts ("~") are rejected
   """
@@ -141,50 +105,108 @@ defmodule Sagents.Middleware.FileSystem do
   alias LangChain.Function
   alias Sagents.FileSystem.FileEntry
   alias Sagents.FileSystemServer
+  alias Sagents.TextLines
 
-  @system_prompt """
-  ## Filesystem Tools
+  @default_enabled_tools [
+    "list_files",
+    "read_file",
+    "create_file",
+    "replace_file_text",
+    "replace_file_lines",
+    "find_in_file",
+    "delete_file",
+    "move_file"
+  ]
 
-  You have access to a virtual filesystem with these tools:
-  - `ls`: List files — returns a JSON array of file entries with metadata (path, title, file_type, size, etc.)
-  - `read_file`: Read file contents with line numbers and pagination
-  - `write_file`: Create new files — returns JSON metadata of the created file
-  - `edit_file`: Modify existing files with string replacement
-  - `search_text`: Search for text patterns in specific files or across all files
-  - `edit_lines`: Replace a block of lines by line number range
-  - `delete_file`: Delete files from the filesystem
-  - `move_file`: Move or rename files and directories
+  # Default `display_text` per tool. Single source of truth so the defaults
+  # aren't scattered across builder functions and `get_display_text/2` can
+  # fall back consistently.
+  @default_display_texts %{
+    "list_files" => "Listing files",
+    "read_file" => "Reading file",
+    "create_file" => "Creating file",
+    "replace_file_text" => "Replacing file text",
+    "replace_file_lines" => "Replacing file lines",
+    "find_in_file" => "Searching file",
+    "delete_file" => "Deleting file",
+    "move_file" => "Moving file"
+  }
 
-  ## File Organization
+  # Per-tool bullet for the "You have access to..." list. Keyed by tool name so
+  # enabling/disabling a tool via `:enabled_tools` adds/removes exactly one line.
+  @tool_descriptions %{
+    "list_files" =>
+      "`list_files`: List files — returns a JSON array of file entries with metadata (path, size, etc.). Optionally filter by wildcard pattern.",
+    "read_file" => "`read_file`: Read file contents with line numbers and pagination.",
+    "create_file" =>
+      "`create_file`: Create a new file with content. Errors if the file already exists.",
+    "replace_file_text" =>
+      "`replace_file_text`: Replace a string with another string in an existing file. The old_string must appear exactly once unless replace_all is set.",
+    "replace_file_lines" =>
+      "`replace_file_lines`: Replace a range of lines (by line number) with new content. More token-efficient than replace_file_text for large block replacements.",
+    "find_in_file" =>
+      "`find_in_file`: Find text or regex matches within a single file. Requires an exact file path — use `list_files` first to discover paths.",
+    "delete_file" => "`delete_file`: Delete a file from the filesystem.",
+    "move_file" => "`move_file`: Move or rename a file."
+  }
+
+  # Per-tool best-practice bullet(s). A tool may contribute multiple lines.
+  # Lines are dropped entirely when the tool isn't enabled, so the prompt
+  # never advises using a tool the agent can't call.
+  @tool_best_practices %{
+    "list_files" => ["Always use `list_files` first to see available files"],
+    "read_file" => ["Read files before editing to understand content"],
+    "create_file" => ["Use `create_file` only for new files (errors if file exists)"],
+    "replace_file_text" => [
+      "Use `replace_file_text` for small, targeted edits where you have the exact text",
+      "Provide sufficient context in `old_string` for `replace_file_text` to ensure unique matches"
+    ],
+    "replace_file_lines" => [
+      "Use `replace_file_lines` for large block replacements (more token-efficient)"
+    ],
+    "find_in_file" => [],
+    "move_file" => ["Use `move_file` to rename files or move them to a different path"],
+    "delete_file" => ["Never `delete_file` without first using `list_files` to locate it"]
+  }
+
+  # Compile-time guarantee that every known tool has a description and
+  # best-practices entry. Adding a tool to `@default_enabled_tools` without
+  # updating these maps will fail the build.
+  for tool <- @default_enabled_tools do
+    unless Map.has_key?(@tool_descriptions, tool) do
+      raise "Missing @tool_descriptions entry for #{inspect(tool)}"
+    end
+
+    unless Map.has_key?(@tool_best_practices, tool) do
+      raise "Missing @tool_best_practices entry for #{inspect(tool)}"
+    end
+  end
+
+  @prompt_header "## Virtual Filesystem\n\nYou have access to a virtual filesystem with these tools:"
+
+  @prompt_file_organization """
+  ### File Organization
 
   Use hierarchical paths to organize files logically:
   - All paths must start with a forward slash "/"
-  - Examples: "/notes.txt", "/Chapter1/summary.md", "/data/results.csv"
-  - No path traversal ("..") or home directory ("~") allowed
+  - Examples: "/notes.txt", "/reports/q1-summary.md", "/data/results.csv"
+  - No path traversal ("..") or home directory ("~") allowed\
+  """
 
+  @prompt_pattern_filtering """
   ## Pattern Filtering
 
-  The `ls` tool supports wildcard patterns:
+  The `list_files` tool supports wildcard patterns:
   - `*` matches any characters
-  - Examples: `*summary*`, `*.md`, `/Chapter1/*`
+  - Examples: `*summary*`, `*.md`, `/reports/*`\
+  """
 
-  ## Best Practices
-
-  - Always use `ls` first to see available files
-  - Read files before editing to understand content
-  - Use `edit_file` for small, targeted edits with string replacement
-  - Use `edit_lines` for large block replacements (more efficient with tokens)
-  - Use `write_file` only for new files
-  - Provide sufficient context in `old_string` to ensure unique matches
-  - Group related files in the same directory
-  - Use `move_file` to rename files or move them to a different directory
-  - Never `delete_file` without first using `ls` to locate it
-
-  ## Persistence Behavior
+  @prompt_persistence """
+  ### Persistence Behavior
 
   - Different directories may have different persistence settings
   - Some directories may be read-only (you can read but not write)
-  - Large or archived files may load slowly on first access
+  - Large or archived files may load slowly on first access\
   """
 
   @impl true
@@ -202,56 +224,162 @@ defmodule Sagents.Middleware.FileSystem do
           scope
       end
 
-    config = %{
-      filesystem_scope: filesystem_scope,
-      # Tool configuration
-      enabled_tools:
-        Keyword.get(opts, :enabled_tools, [
-          "ls",
-          "read_file",
-          "write_file",
-          "edit_file",
-          "search_text",
-          "edit_lines",
-          "delete_file",
-          "move_file"
-        ]),
-      custom_tool_descriptions: Keyword.get(opts, :custom_tool_descriptions, %{}),
-      entry_to_map: Keyword.get(opts, :entry_to_map, &__MODULE__.default_entry_to_map/1)
-    }
+    enabled_tools = Keyword.get(opts, :enabled_tools, @default_enabled_tools)
+    custom_tool_descriptions = Keyword.get(opts, :custom_tool_descriptions, %{})
+    custom_display_texts = Keyword.get(opts, :custom_display_texts, %{})
 
-    {:ok, config}
+    with :ok <- validate_enabled_tools(enabled_tools),
+         :ok <- validate_custom_tool_descriptions(custom_tool_descriptions),
+         :ok <- validate_custom_display_texts(custom_display_texts) do
+      config = %{
+        filesystem_scope: filesystem_scope,
+        # Tool configuration
+        enabled_tools: enabled_tools,
+        custom_tool_descriptions: custom_tool_descriptions,
+        custom_display_texts: custom_display_texts
+      }
+
+      {:ok, config}
+    end
+  end
+
+  # Rejects unknown tool names in `:enabled_tools` so misconfigured middleware
+  # fails fast at agent construction (rather than silently dropping the entry
+  # in `tools/1`). This is especially useful when a tool is renamed: stale
+  # config will surface immediately instead of becoming a silent no-op.
+  defp validate_enabled_tools(enabled_tools) when is_list(enabled_tools) do
+    unknown = Enum.reject(enabled_tools, &(&1 in @default_enabled_tools))
+
+    if unknown == [] do
+      :ok
+    else
+      {:error,
+       "Unknown tool name(s) in :enabled_tools: #{inspect(unknown)}. " <>
+         "Valid tools: #{inspect(@default_enabled_tools)}."}
+    end
+  end
+
+  defp validate_enabled_tools(other) do
+    {:error, ":enabled_tools must be a list of tool name strings, got: #{inspect(other)}"}
+  end
+
+  # Rejects unknown keys in `:custom_tool_descriptions`. Same rationale as
+  # `validate_enabled_tools/1`: a stale key from a renamed tool is silently
+  # ignored at lookup time (`get_custom_description/3`), which makes typos
+  # and migration leftovers invisible. Validates against the full set of
+  # known tools — not just the currently-enabled subset — so a description
+  # for a tool the user has temporarily disabled is still allowed.
+  defp validate_custom_tool_descriptions(descriptions) when is_map(descriptions) do
+    unknown =
+      descriptions
+      |> Map.keys()
+      |> Enum.reject(&(&1 in @default_enabled_tools))
+
+    if unknown == [] do
+      :ok
+    else
+      {:error,
+       "Unknown tool name(s) in :custom_tool_descriptions: #{inspect(unknown)}. " <>
+         "Valid tools: #{inspect(@default_enabled_tools)}."}
+    end
+  end
+
+  defp validate_custom_tool_descriptions(other) do
+    {:error,
+     ":custom_tool_descriptions must be a map of tool name strings to descriptions, got: #{inspect(other)}"}
+  end
+
+  # Same validation shape as `validate_custom_tool_descriptions/1`: reject
+  # unknown tool names so typos/stale keys surface at construction time
+  # rather than silently falling through to the default at lookup time.
+  # Also validates values are strings — `display_text` is always rendered in
+  # the UI, so a non-string value is a programming error worth catching early.
+  defp validate_custom_display_texts(display_texts) when is_map(display_texts) do
+    unknown =
+      display_texts
+      |> Map.keys()
+      |> Enum.reject(&(&1 in @default_enabled_tools))
+
+    non_string =
+      display_texts
+      |> Enum.reject(fn {_k, v} -> is_binary(v) end)
+
+    cond do
+      unknown != [] ->
+        {:error,
+         "Unknown tool name(s) in :custom_display_texts: #{inspect(unknown)}. " <>
+           "Valid tools: #{inspect(@default_enabled_tools)}."}
+
+      non_string != [] ->
+        {:error, ":custom_display_texts values must be strings, got: #{inspect(non_string)}"}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_custom_display_texts(other) do
+    {:error,
+     ":custom_display_texts must be a map of tool name strings to display text strings, got: #{inspect(other)}"}
   end
 
   @impl true
-  def system_prompt(_config) do
-    @system_prompt
+  def system_prompt(config) do
+    enabled = Map.get(config, :enabled_tools, @default_enabled_tools)
+
+    [
+      @prompt_header <> "\n" <> tool_list_section(enabled),
+      @prompt_file_organization,
+      maybe_pattern_filtering_section(enabled),
+      best_practices_section(enabled),
+      @prompt_persistence
+    ]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n\n")
+  end
+
+  # Emit bullets in canonical (`@default_enabled_tools`) order so the prompt
+  # is deterministic regardless of how the user ordered their `:enabled_tools`.
+  defp tool_list_section(enabled) do
+    @default_enabled_tools
+    |> Enum.filter(&(&1 in enabled))
+    |> Enum.map(&("- " <> Map.fetch!(@tool_descriptions, &1)))
+    |> Enum.join("\n")
+  end
+
+  defp maybe_pattern_filtering_section(enabled) do
+    if "list_files" in enabled, do: @prompt_pattern_filtering
+  end
+
+  defp best_practices_section(enabled) do
+    bullets =
+      @default_enabled_tools
+      |> Enum.filter(&(&1 in enabled))
+      |> Enum.flat_map(&Map.fetch!(@tool_best_practices, &1))
+
+    case bullets do
+      [] ->
+        nil
+
+      lines ->
+        "### Best Practices\n\n" <> Enum.map_join(lines, "\n", &("- " <> &1))
+    end
   end
 
   @impl true
   def tools(config) do
     all_tools = %{
-      "ls" => build_ls_tool(config),
+      "list_files" => build_list_files_tool(config),
       "read_file" => build_read_file_tool(config),
-      "write_file" => build_write_file_tool(config),
-      "edit_file" => build_edit_file_tool(config),
-      "search_text" => build_search_text_tool(config),
-      "edit_lines" => build_edit_lines_tool(config),
+      "create_file" => build_create_file_tool(config),
+      "replace_file_text" => build_replace_text_tool(config),
+      "replace_file_lines" => build_replace_lines_tool(config),
+      "find_in_file" => build_find_in_file_tool(config),
       "delete_file" => build_delete_file_tool(config),
       "move_file" => build_move_file_tool(config)
     }
 
-    enabled_tools =
-      Map.get(config, :enabled_tools, [
-        "ls",
-        "read_file",
-        "write_file",
-        "edit_file",
-        "search_text",
-        "edit_lines",
-        "delete_file",
-        "move_file"
-      ])
+    enabled_tools = Map.get(config, :enabled_tools, @default_enabled_tools)
 
     enabled_tools
     |> Enum.map(fn tool_name -> Map.get(all_tools, tool_name) end)
@@ -264,84 +392,38 @@ defmodule Sagents.Middleware.FileSystem do
     []
   end
 
-  @doc """
-  Converts a FileEntry to a JSON-friendly map for LLM tool results.
-
-  Does not include content (which could be very large). Includes size
-  from metadata when available. Only includes `id` if it has a value.
-
-  This is the default implementation used by the `entry_to_map` config
-  option. Override it by providing a custom function in middleware config:
-
-      {Sagents.Middleware.FileSystem, [
-        filesystem_scope: {:project, project_id},
-        entry_to_map: &MyApp.custom_entry_to_map/1
-      ]}
-  """
-  @spec default_entry_to_map(FileEntry.t()) :: map()
-  def default_entry_to_map(%FileEntry{} = entry) do
-    %{
-      path: entry.path,
-      title: entry.title,
-      entry_type: entry.entry_type,
-      file_type: entry.file_type,
-      persistence: entry.persistence,
-      size: entry.metadata && entry.metadata.size
-    }
-    |> maybe_add_field(:id, entry.id)
-  end
-
-  @doc """
-  Conditionally adds a key-value pair to a map. If the value is nil, the map
-  is returned unchanged. Useful as a helper when building custom `entry_to_map`
-  functions.
-
-  ## Example
-
-      Sagents.Middleware.FileSystem.default_entry_to_map(entry)
-      |> Sagents.Middleware.FileSystem.maybe_add_field(:tags, custom["tags"])
-  """
-  @spec maybe_add_field(map(), atom(), any()) :: map()
-  def maybe_add_field(map, _key, nil), do: map
-  def maybe_add_field(map, key, value), do: Map.put(map, key, value)
-
   # Tool builders
 
-  defp build_ls_tool(config) do
+  defp build_list_files_tool(config) do
     default_description = """
-    Lists files in the filesystem, optionally filtering by pattern or directory.
+    Lists files in the filesystem, optionally filtering by wildcard pattern.
 
-    Usage:
-    - The list_files tool will return a list of the files in the filesystem.
-    - You can optionally provide a path parameter to list files in a specific directory.
-    - You can optionally provide a pattern parameter to filter the files by pattern.
-    - This is very useful for exploring the file system and finding the right file to read or edit.
-    - You should almost ALWAYS use this tool before using the read or edit tools.
+    Returns a JSON array of file entries with metadata (path, title, file_type, size, etc.).
 
-    Optionally filter by pattern using wildcards:
+    Wildcard patterns:
     - Use '*' to match any characters
-    - Examples: '*summary*', '*.md', '/Chapter 1/*'
+    - Examples: '*summary*', '*.md', '/reports/*'
 
-    Without a pattern, lists all files.
+    You should almost ALWAYS use this tool before using the read or replace tools.
     """
 
-    description = get_custom_description(config, "ls", default_description)
+    description = get_custom_description(config, "list_files", default_description)
 
     Function.new!(%{
-      name: "ls",
+      name: "list_files",
       description: description,
-      display_text: "Listing files",
+      display_text: get_display_text(config, "list_files"),
       parameters_schema: %{
         type: "object",
         properties: %{
           pattern: %{
             type: "string",
             description:
-              "Optional wildcard pattern to filter files (e.g., '*summary*', '*.md', '/Chapter 1/*')"
+              "Optional wildcard pattern to filter files (e.g., '*summary*', '*.md', '/reports/*')"
           }
         }
       },
-      function: fn args, context -> execute_ls_tool(args, context, config) end
+      function: fn args, context -> execute_list_files_tool(args, context, config) end
     })
   end
 
@@ -358,7 +440,7 @@ defmodule Sagents.Middleware.FileSystem do
     Function.new!(%{
       name: "read_file",
       description: description,
-      display_text: "Reading file",
+      display_text: get_display_text(config, "read_file"),
       parameters_schema: %{
         type: "object",
         properties: %{
@@ -383,26 +465,26 @@ defmodule Sagents.Middleware.FileSystem do
     })
   end
 
-  defp build_write_file_tool(config) do
+  defp build_create_file_tool(config) do
     default_description = """
-    Write content to a file (creates new files only).
+    Create a new file with content.
 
-    This tool creates new files. If the file already exists, an error will be returned.
-    Use edit_file to modify existing files.
+    This tool only creates new files. If the file already exists, an error will be
+    returned — use replace_file_text or replace_file_lines to modify existing files instead.
     """
 
-    description = get_custom_description(config, "write_file", default_description)
+    description = get_custom_description(config, "create_file", default_description)
 
     Function.new!(%{
-      name: "write_file",
+      name: "create_file",
       description: description,
-      display_text: "Writing file",
+      display_text: get_display_text(config, "create_file"),
       parameters_schema: %{
         type: "object",
         properties: %{
           file_path: %{
             type: "string",
-            description: "Path where the file should be written"
+            description: "Path where the file should be created"
           },
           content: %{
             type: "string",
@@ -411,25 +493,27 @@ defmodule Sagents.Middleware.FileSystem do
         },
         required: ["file_path", "content"]
       },
-      function: fn args, context -> execute_write_file_tool(args, context, config) end
+      function: fn args, context -> execute_create_file_tool(args, context, config) end
     })
   end
 
-  defp build_edit_file_tool(config) do
+  defp build_replace_text_tool(config) do
     default_description = """
-    Edit a file by replacing old_string with new_string.
+    Replace a string with another string in an existing file.
 
-    Performs string replacement within the file. By default, requires
-    old_string to appear exactly once (for safety). Use replace_all: true
-    to replace multiple occurrences.
+    By default, the old_string must appear exactly once in the file (for safety).
+    Use replace_all: true to replace every occurrence.
+
+    For large block replacements where you have line numbers, prefer replace_file_lines —
+    it is significantly more token-efficient.
     """
 
-    description = get_custom_description(config, "edit_file", default_description)
+    description = get_custom_description(config, "replace_file_text", default_description)
 
     Function.new!(%{
-      name: "edit_file",
+      name: "replace_file_text",
       description: description,
-      display_text: "Editing file",
+      display_text: get_display_text(config, "replace_file_text"),
       parameters_schema: %{
         type: "object",
         properties: %{
@@ -453,7 +537,7 @@ defmodule Sagents.Middleware.FileSystem do
         },
         required: ["file_path", "old_string", "new_string"]
       },
-      function: fn args, context -> execute_edit_file_tool(args, context, config) end
+      function: fn args, context -> execute_replace_text_tool(args, context, config) end
     })
   end
 
@@ -470,7 +554,7 @@ defmodule Sagents.Middleware.FileSystem do
     Function.new!(%{
       name: "delete_file",
       description: description,
-      display_text: "Deleting file",
+      display_text: get_display_text(config, "delete_file"),
       parameters_schema: %{
         type: "object",
         properties: %{
@@ -495,10 +579,10 @@ defmodule Sagents.Middleware.FileSystem do
     - Use this to rename files or reorganize the directory structure
     - The target path must not already exist
 
-    Examples:
-    - Rename: move_file(old_path: "/draft.txt", new_path: "/final.txt")
-    - Move to directory: move_file(old_path: "/notes.txt", new_path: "/archive/notes.txt")
-    - Rename directory: move_file(old_path: "/Chapter 1", new_path: "/Part 1")
+    Examples (call with a JSON object matching the schema):
+    - Rename a file: {"old_path": "/draft.txt", "new_path": "/final.txt"}
+    - Move to a directory: {"old_path": "/notes.txt", "new_path": "/archive/notes.txt"}
+    - Rename a directory: {"old_path": "/drafts", "new_path": "/published"}
     """
 
     description = get_custom_description(config, "move_file", default_description)
@@ -506,7 +590,7 @@ defmodule Sagents.Middleware.FileSystem do
     Function.new!(%{
       name: "move_file",
       description: description,
-      display_text: "Moving file",
+      display_text: get_display_text(config, "move_file"),
       parameters_schema: %{
         type: "object",
         properties: %{
@@ -525,32 +609,39 @@ defmodule Sagents.Middleware.FileSystem do
     })
   end
 
-  defp build_search_text_tool(config) do
+  defp build_find_in_file_tool(config) do
     default_description = """
-    Search for text patterns within files.
+    Find text or regex matches within a single file.
 
-    Can search within a specific file or across all loaded files.
-    Returns matches with line numbers and optional context lines.
+    Returns matches with line numbers and optional surrounding context lines.
+    This tool searches one specific file at a time. To search across multiple
+    files, call `list_files` first to discover paths, then call `find_in_file`
+    for each path you want to search.
+
+    Wildcards and glob patterns (e.g. `/chapters/*`) are NOT supported in
+    `file_path` — provide an exact path. Use `list_files` with a pattern to
+    enumerate matching files first.
 
     Usage:
     - Provide pattern (required) - text or regex to search for
-    - Provide file_path (optional) - if omitted, searches all files
+    - Provide file_path (required) - exact path to the file to search
     - Set case_sensitive (optional, default: true)
     - Set context_lines (optional, default: 0) - lines before/after to show
     - Set max_results (optional, default: 50) - limit number of results
 
-    Examples:
-    - Search single file: search_text(pattern: "TODO", file_path: "/notes.txt")
-    - Search all files: search_text(pattern: "important", case_sensitive: false)
-    - With context: search_text(pattern: "error", context_lines: 2)
+    Examples (call with a JSON object matching the schema):
+    - Find a literal string: {"pattern": "TODO", "file_path": "/notes.txt"}
+    - Case-insensitive: {"pattern": "important", "file_path": "/notes.txt", "case_sensitive": false}
+    - With surrounding context: {"pattern": "error", "file_path": "/app.log", "context_lines": 2}
+    - Regex pattern: {"pattern": "error\\\\d+", "file_path": "/app.log"}
     """
 
-    description = get_custom_description(config, "search_text", default_description)
+    description = get_custom_description(config, "find_in_file", default_description)
 
     Function.new!(%{
-      name: "search_text",
+      name: "find_in_file",
       description: description,
-      display_text: "Searching files",
+      display_text: get_display_text(config, "find_in_file"),
       parameters_schema: %{
         "type" => "object",
         "properties" => %{
@@ -561,7 +652,7 @@ defmodule Sagents.Middleware.FileSystem do
           "file_path" => %{
             "type" => "string",
             "description" =>
-              "Optional: specific file to search. If omitted, searches all loaded files."
+              "Exact path of the file to search (e.g. '/notes.txt'). Wildcards/globs are not supported."
           },
           "case_sensitive" => %{
             "type" => "boolean",
@@ -579,46 +670,51 @@ defmodule Sagents.Middleware.FileSystem do
             "default" => 50
           }
         },
-        "required" => ["pattern"]
+        "required" => ["pattern", "file_path"]
       },
-      function: fn args, context -> execute_search_text_tool(args, context, config) end
+      function: fn args, context -> execute_find_in_file_tool(args, context, config) end
     })
   end
 
-  defp build_edit_lines_tool(config) do
+  defp build_replace_lines_tool(config) do
     default_description = """
-    Edit a file by replacing a range of lines with new content.
+    Replace a range of lines (by line number) with new content. Line numbers are
+    1-based and the range is inclusive (both start_line and end_line are replaced).
 
-    This tool is more efficient than edit_file for replacing large blocks of text,
-    such as rewriting multiple paragraphs or sections. It uses line numbers instead
-    of string matching, making it more reliable for large edits.
+    This tool is significantly more token-efficient than replace_file_text for large
+    block replacements — you don't need to send the original content character-
+    for-character, just the line range.
 
-    Line numbers are 1-based (matching read_file output) and the range is inclusive
-    (both start_line and end_line are replaced).
+    ## Best Practices
 
-    Usage:
-    - First use read_file to see the file with line numbers
-    - Identify the start_line and end_line you want to replace
-    - Provide new_content to replace those lines
-    - The tool will replace lines [start_line, end_line] inclusive
+    - ALWAYS use read_file first to see the current line numbers. Line numbers
+      shift after every edit, so re-read between edits if you're making multiple
+      changes to the same file.
+    - Carefully verify start_line and end_line before calling. Wrong line numbers
+      will destructively replace the wrong content with no way to undo.
+    - For small, targeted edits where you know the exact text, use replace_file_text
+      instead — it has a built-in safety check (the old_string must match).
+    - For multi-line replacements where you have line numbers from a recent
+      read_file, this tool is the right choice.
 
-    Examples:
-    - Replace lines 10-15: edit_lines(file_path: "/doc.txt", start_line: 10, end_line: 15, new_content: "new text")
-    - Replace single line: edit_lines(file_path: "/doc.txt", start_line: 42, end_line: 42, new_content: "new line")
-    - Replace large block: edit_lines(file_path: "/story.txt", start_line: 120, end_line: 135, new_content: "...")
+    ## Examples
 
-    Best practices:
-    - Use read_file first to verify line numbers
-    - For small, targeted edits, use edit_file instead
-    - For large block replacements, this tool is more efficient
+    Call with a JSON object matching the schema:
+
+    - Replace lines 10-15:
+      {"file_path": "/doc.txt", "start_line": 10, "end_line": 15, "new_content": "new text"}
+    - Replace a single line:
+      {"file_path": "/doc.txt", "start_line": 42, "end_line": 42, "new_content": "new line"}
+    - Replace a large block:
+      {"file_path": "/notes/research.md", "start_line": 120, "end_line": 135, "new_content": "..."}
     """
 
-    description = get_custom_description(config, "edit_lines", default_description)
+    description = get_custom_description(config, "replace_file_lines", default_description)
 
     Function.new!(%{
-      name: "edit_lines",
+      name: "replace_file_lines",
       description: description,
-      display_text: "Editing file lines",
+      display_text: get_display_text(config, "replace_file_lines"),
       parameters_schema: %{
         type: "object",
         properties: %{
@@ -641,13 +737,13 @@ defmodule Sagents.Middleware.FileSystem do
         },
         required: ["file_path", "start_line", "end_line", "new_content"]
       },
-      function: fn args, context -> execute_edit_lines_tool(args, context, config) end
+      function: fn args, context -> execute_replace_lines_tool(args, context, config) end
     })
   end
 
   # Tool execution functions
 
-  defp execute_ls_tool(args, _context, config) do
+  defp execute_list_files_tool(args, _context, config) do
     pattern = get_arg(args, "pattern")
 
     # List all entries using FileSystemServer (returns FileEntry structs with metadata)
@@ -663,7 +759,7 @@ defmodule Sagents.Middleware.FileSystem do
         {:ok, "No files in filesystem"}
       end
     else
-      entry_maps = Enum.map(filtered_entries, &config.entry_to_map.(&1))
+      entry_maps = Enum.map(filtered_entries, &FileEntry.to_llm_map/1)
       {:ok, Jason.encode!(entry_maps)}
     end
   rescue
@@ -698,47 +794,21 @@ defmodule Sagents.Middleware.FileSystem do
   end
 
   defp format_file_content(content, _file_path, offset, limit) do
-    lines = String.split(content, "\n")
-    total_lines = length(lines)
-
-    # Apply offset and limit
-    selected_lines =
-      lines
-      |> Enum.slice(offset, limit)
-      |> Enum.with_index(offset)
-      |> Enum.map(fn {line, idx} ->
-        # Format with fixed-width line numbers (1-based for display), truncate long lines
-        line_num = String.pad_leading(Integer.to_string(idx + 1), 6)
-
-        truncated_line =
-          if String.length(line) > 2000 do
-            String.slice(line, 0, 2000) <> "... (line truncated)"
-          else
-            line
-          end
-
-        "#{line_num}\t#{truncated_line}"
-      end)
+    # Convert 0-based offset to 1-based for TextLines
+    {formatted, start_line, end_line, _total} =
+      TextLines.render(content, offset: offset + 1, limit: limit)
 
     result =
-      if Enum.empty?(selected_lines) do
+      if end_line < start_line do
         "File is empty or offset is beyond file length."
       else
-        header =
-          if offset > 0 or offset + limit < total_lines do
-            showing_end = min(offset + limit, total_lines)
-            "Showing lines #{offset + 1} to #{showing_end} of #{total_lines}:\n"
-          else
-            ""
-          end
-
-        header <> Enum.join(selected_lines, "\n")
+        formatted
       end
 
     {:ok, result}
   end
 
-  defp execute_write_file_tool(args, _context, config) do
+  defp execute_create_file_tool(args, _context, config) do
     file_path = get_arg(args, "file_path")
     content = get_arg(args, "content")
 
@@ -752,7 +822,7 @@ defmodule Sagents.Middleware.FileSystem do
           # Check if file already exists (overwrite protection)
           if FileSystemServer.file_exists?(config.filesystem_scope, normalized_path) do
             {:error,
-             "File already exists: #{normalized_path}. Use edit_file to modify existing files."}
+             "File already exists: #{normalized_path}. Use replace_file_text or replace_file_lines to modify existing files."}
           else
             # Write file using FileSystemServer
             case FileSystemServer.write_file(
@@ -761,7 +831,7 @@ defmodule Sagents.Middleware.FileSystem do
                    content
                  ) do
               {:ok, entry} ->
-                {:ok, Jason.encode!(config.entry_to_map.(entry))}
+                {:ok, Jason.encode!(FileEntry.to_llm_map(entry))}
 
               {:error, reason} ->
                 {:error, "Failed to create file: #{inspect(reason)}"}
@@ -776,7 +846,7 @@ defmodule Sagents.Middleware.FileSystem do
       {:error, "Filesystem not available: #{Exception.message(e)}"}
   end
 
-  defp execute_edit_file_tool(args, _context, config) do
+  defp execute_replace_text_tool(args, _context, config) do
     file_path = get_arg(args, "file_path")
     old_string = get_arg(args, "old_string")
     new_string = get_arg(args, "new_string")
@@ -792,7 +862,7 @@ defmodule Sagents.Middleware.FileSystem do
           # Read current content using FileSystemServer
           case FileSystemServer.read_file(config.filesystem_scope, normalized_path) do
             {:ok, entry} ->
-              perform_edit(
+              perform_text_replacement(
                 config.filesystem_scope,
                 normalized_path,
                 entry.content || "",
@@ -879,7 +949,7 @@ defmodule Sagents.Middleware.FileSystem do
       {:error, "Filesystem not available: #{Exception.message(e)}"}
   end
 
-  defp execute_search_text_tool(args, _context, config) do
+  defp execute_find_in_file_tool(args, _context, config) do
     pattern = get_arg(args, "pattern")
     file_path = get_arg(args, "file_path")
     case_sensitive = get_boolean_arg(args, "case_sensitive", true)
@@ -890,28 +960,38 @@ defmodule Sagents.Middleware.FileSystem do
       is_nil(pattern) ->
         {:error, "pattern is required"}
 
+      is_nil(file_path) ->
+        {:error, "file_path is required"}
+
+      String.contains?(file_path, ["*", "?", "[", "]"]) ->
+        {:error,
+         "Wildcards and globs are not supported in file_path. Provide an exact file path (e.g., '/notes.txt'). Use list_files to discover matching files first."}
+
       true ->
-        # Compile regex pattern with inline flags for case-insensitive search
-        pattern_with_flags = if case_sensitive, do: pattern, else: "(?i)#{pattern}"
+        with {:ok, normalized_path} <- validate_path(file_path),
+             {:ok, entry} <-
+               FileSystemServer.read_file(config.filesystem_scope, normalized_path) do
+          case TextLines.find(entry.content || "", pattern,
+                 regex: true,
+                 case_sensitive: case_sensitive,
+                 context_lines: context_lines,
+                 max_matches: max_results
+               ) do
+            {:ok, matches, truncated} ->
+              format_search_results([{normalized_path, matches}], max_results, truncated)
 
-        case Regex.compile(pattern_with_flags) do
-          {:ok, regex} ->
-            if file_path do
-              # Search single file
-              search_single_file(
-                config.filesystem_scope,
-                file_path,
-                regex,
-                context_lines,
-                max_results
-              )
-            else
-              # Search all files
-              search_all_files(config.filesystem_scope, regex, context_lines, max_results)
-            end
+            {:error, reason} ->
+              {:error, reason}
+          end
+        else
+          {:error, :enoent} ->
+            {:error, "File not found: #{file_path}"}
 
-          {:error, _reason} ->
-            {:error, "Invalid regex pattern: #{pattern}"}
+          {:error, reason} when is_binary(reason) ->
+            {:error, reason}
+
+          {:error, reason} ->
+            {:error, "Failed to search file: #{inspect(reason)}"}
         end
     end
   rescue
@@ -919,7 +999,7 @@ defmodule Sagents.Middleware.FileSystem do
       {:error, "Search failed: #{Exception.message(e)}"}
   end
 
-  defp execute_edit_lines_tool(args, _context, config) do
+  defp execute_replace_lines_tool(args, _context, config) do
     file_path = get_arg(args, "file_path")
     start_line = get_integer_arg(args, "start_line", nil)
     end_line = get_integer_arg(args, "end_line", nil)
@@ -945,7 +1025,7 @@ defmodule Sagents.Middleware.FileSystem do
         with {:ok, normalized_path} <- validate_path(file_path),
              {:ok, entry} <-
                FileSystemServer.read_file(config.filesystem_scope, normalized_path) do
-          perform_line_edit(
+          perform_line_replacement(
             config.filesystem_scope,
             normalized_path,
             entry.content || "",
@@ -964,106 +1044,6 @@ defmodule Sagents.Middleware.FileSystem do
   rescue
     e ->
       {:error, "Edit failed: #{Exception.message(e)}"}
-  end
-
-  defp search_single_file(filesystem_scope, file_path, regex, context_lines, max_results) do
-    with {:ok, normalized_path} <- validate_path(file_path),
-         {:ok, entry} <- FileSystemServer.read_file(filesystem_scope, normalized_path) do
-      {matches, truncated} =
-        find_matches_in_content(entry.content || "", regex, context_lines, max_results)
-
-      format_search_results([{normalized_path, matches}], max_results, truncated)
-    else
-      {:error, :enoent} ->
-        {:error, "File not found: #{file_path}"}
-
-      {:error, reason} ->
-        {:error, "Failed to search file: #{inspect(reason)}"}
-    end
-  end
-
-  defp search_all_files(filesystem_scope, regex, context_lines, max_results) do
-    all_files = FileSystemServer.list_files(filesystem_scope)
-
-    # Search each file and collect matches, tracking total matches
-    {results, _total_matches, any_truncated} =
-      all_files
-      |> Enum.reduce({[], 0, false}, fn file_path, {acc, match_count, truncated} ->
-        # Calculate remaining limit for this file
-        remaining = max_results - match_count
-
-        if remaining <= 0 do
-          # Already hit limit, stop collecting
-          {acc, match_count, truncated}
-        else
-          case FileSystemServer.read_file(filesystem_scope, file_path) do
-            {:ok, entry} ->
-              {matches, file_truncated} =
-                find_matches_in_content(entry.content || "", regex, context_lines, remaining)
-
-              if Enum.empty?(matches) do
-                {acc, match_count, truncated}
-              else
-                {[{file_path, matches} | acc], match_count + length(matches),
-                 truncated or file_truncated}
-              end
-
-            {:error, _} ->
-              {acc, match_count, truncated}
-          end
-        end
-      end)
-
-    results = Enum.reverse(results)
-    format_search_results(results, max_results, any_truncated)
-  end
-
-  defp find_matches_in_content(content, regex, context_lines, max_results) do
-    lines = String.split(content, "\n")
-
-    # Collect up to max_results + 1 to detect truncation
-    matches =
-      lines
-      |> Enum.with_index(1)
-      |> Enum.reduce([], fn {line, line_num}, acc ->
-        if length(acc) > max_results do
-          acc
-        else
-          if Regex.match?(regex, line) do
-            match_info = %{
-              line_number: line_num,
-              line: line,
-              context: extract_context(lines, line_num - 1, context_lines)
-            }
-
-            [match_info | acc]
-          else
-            acc
-          end
-        end
-      end)
-      |> Enum.reverse()
-
-    # Return matches and truncation flag
-    if length(matches) > max_results do
-      {Enum.take(matches, max_results), true}
-    else
-      {matches, false}
-    end
-  end
-
-  defp extract_context(lines, zero_based_line_num, context_lines) do
-    if context_lines > 0 do
-      start_idx = max(0, zero_based_line_num - context_lines)
-      end_idx = min(length(lines) - 1, zero_based_line_num + context_lines)
-
-      %{
-        before: Enum.slice(lines, start_idx, zero_based_line_num - start_idx),
-        after: Enum.slice(lines, zero_based_line_num + 1, end_idx - zero_based_line_num)
-      }
-    else
-      nil
-    end
   end
 
   defp format_search_results(results, max_results, truncated) do
@@ -1085,94 +1065,61 @@ defmodule Sagents.Middleware.FileSystem do
     end
   end
 
-  defp format_match(%{line_number: line_num, line: line, context: nil}) do
-    # Format line number the same way as format_file_content (6 chars padded, tab separator)
-    formatted_line_num = String.pad_leading(Integer.to_string(line_num), 6)
-    "#{formatted_line_num}\t#{line}"
-  end
-
-  defp format_match(%{line_number: line_num, line: line, context: context}) do
-    # Format context lines with line numbers
+  defp format_match(%{
+         line_number: line_num,
+         line: line,
+         context_before: context_before,
+         context_after: context_after
+       }) do
     before =
-      if context.before do
-        context.before
-        |> Enum.with_index()
-        |> Enum.map(fn {ctx_line, idx} ->
-          # Calculate line number for context line
-          ctx_line_num = line_num - length(context.before) + idx
-          formatted_num = String.pad_leading(Integer.to_string(ctx_line_num), 6)
-          "#{formatted_num} |\t#{ctx_line}"
-        end)
-        |> Enum.join("\n")
-      else
-        ""
-      end
+      context_before
+      |> Enum.with_index()
+      |> Enum.map(fn {ctx_line, idx} ->
+        ctx_line_num = line_num - length(context_before) + idx
+        formatted_num = String.pad_leading(Integer.to_string(ctx_line_num), 6)
+        "#{formatted_num} |\t#{ctx_line}"
+      end)
+      |> Enum.join("\n")
 
     after_ctx =
-      if context.after do
-        context.after
-        |> Enum.with_index()
-        |> Enum.map(fn {ctx_line, idx} ->
-          # Calculate line number for context line
-          ctx_line_num = line_num + idx + 1
-          formatted_num = String.pad_leading(Integer.to_string(ctx_line_num), 6)
-          "#{formatted_num} |\t#{ctx_line}"
-        end)
-        |> Enum.join("\n")
-      else
-        ""
-      end
+      context_after
+      |> Enum.with_index()
+      |> Enum.map(fn {ctx_line, idx} ->
+        ctx_line_num = line_num + idx + 1
+        formatted_num = String.pad_leading(Integer.to_string(ctx_line_num), 6)
+        "#{formatted_num} |\t#{ctx_line}"
+      end)
+      |> Enum.join("\n")
 
-    # Format the matching line
     formatted_line_num = String.pad_leading(Integer.to_string(line_num), 6)
     match_line = "#{formatted_line_num}\t#{line}"
 
-    lines =
-      [
-        before,
-        match_line,
-        after_ctx
-      ]
-      |> Enum.reject(&(&1 == ""))
-      |> Enum.join("\n")
-
-    lines
+    [before, match_line, after_ctx]
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.join("\n")
   end
 
-  defp perform_edit(filesystem_scope, file_path, content, old_string, new_string, replace_all) do
-    # Split to count occurrences
-    parts = String.split(content, old_string, parts: :infinity)
-    occurrence_count = length(parts) - 1
-
-    cond do
-      occurrence_count == 0 ->
-        {:error, "String not found in file: '#{old_string}'"}
-
-      occurrence_count == 1 ->
-        # Single occurrence, safe to replace
-        updated_content = String.replace(content, old_string, new_string, global: false)
-
-        write_edit(
-          filesystem_scope,
-          file_path,
-          updated_content,
-          "File edited successfully: #{file_path}"
-        )
-
-      occurrence_count > 1 and not replace_all ->
-        {:error,
-         "String appears #{occurrence_count} times in file. Use replace_all: true or provide more context in old_string."}
-
-      occurrence_count > 1 and replace_all ->
-        # Replace all occurrences
-        updated_content = String.replace(content, old_string, new_string, global: true)
+  defp perform_text_replacement(
+         filesystem_scope,
+         file_path,
+         content,
+         old_string,
+         new_string,
+         replace_all
+       ) do
+    case TextLines.replace_text(content, old_string, new_string, replace_all) do
+      {:ok, updated_content, count} ->
+        suffix = if count > 1, do: " (#{count} replacements)", else: ""
 
         write_edit(
           filesystem_scope,
           file_path,
           updated_content,
-          "File edited successfully: #{file_path} (#{occurrence_count} replacements)"
+          "File edited successfully: #{file_path}#{suffix}"
         )
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -1186,37 +1133,16 @@ defmodule Sagents.Middleware.FileSystem do
     end
   end
 
-  defp perform_line_edit(filesystem_scope, file_path, content, start_line, end_line, new_content) do
-    lines = String.split(content, "\n")
-    total_lines = length(lines)
-
-    # Convert to 0-based for Enum operations
-    start_idx = start_line - 1
-    end_idx = end_line - 1
-
-    cond do
-      start_idx >= total_lines ->
-        {:error, "start_line #{start_line} is beyond file length (#{total_lines} lines)"}
-
-      end_idx >= total_lines ->
-        {:error, "end_line #{end_line} is beyond file length (#{total_lines} lines)"}
-
-      true ->
-        # Extract the lines being replaced (for confirmation message)
-        replaced_lines = Enum.slice(lines, start_idx, end_idx - start_idx + 1)
-        lines_replaced_count = length(replaced_lines)
-
-        # Build the new file content
-        before = Enum.slice(lines, 0, start_idx)
-        after_lines = Enum.slice(lines, end_idx + 1, total_lines - end_idx - 1)
-
-        # Split new_content into lines (preserving the newlines)
-        new_lines = String.split(new_content, "\n")
-
-        updated_lines = before ++ new_lines ++ after_lines
-        updated_content = Enum.join(updated_lines, "\n")
-
-        # Write the updated content
+  defp perform_line_replacement(
+         filesystem_scope,
+         file_path,
+         content,
+         start_line,
+         end_line,
+         new_content
+       ) do
+    case TextLines.replace_range(content, start_line, end_line, new_content) do
+      {:ok, updated_content, lines_replaced_count} ->
         case FileSystemServer.write_file(filesystem_scope, file_path, updated_content) do
           {:ok, _entry} ->
             {:ok,
@@ -1225,6 +1151,9 @@ defmodule Sagents.Middleware.FileSystem do
           {:error, reason} ->
             {:error, "Failed to save edit: #{inspect(reason)}"}
         end
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -1308,5 +1237,14 @@ defmodule Sagents.Middleware.FileSystem do
   def get_custom_description(config, tool_name, default_description) do
     custom_descriptions = Map.get(config, :custom_tool_descriptions, %{})
     Map.get(custom_descriptions, tool_name, default_description)
+  end
+
+  # Returns the configured display_text for a tool, falling back to the
+  # default when no override is set. Public so the builder functions can
+  # use it; it's a thin lookup, not an API contract.
+  def get_display_text(config, tool_name) do
+    config
+    |> Map.get(:custom_display_texts, %{})
+    |> Map.get(tool_name, Map.fetch!(@default_display_texts, tool_name))
   end
 end

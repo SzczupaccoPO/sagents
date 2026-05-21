@@ -160,14 +160,18 @@ defmodule Sagents.SubAgent do
   The main agent configures a subagent through the task tool by providing:
   - Instructions (becomes user message)
   - Agent configuration (Agent struct)
-  - Parent state (for inheritance)
 
   ## Options
 
   - `:parent_agent_id` - Parent's agent ID (required)
   - `:instructions` - Task description (required)
   - `:agent_config` - Agent struct with tools, model, middleware (required)
-  - `:parent_state` - Parent agent's current state (required)
+  - `:parent_tool_context` - Parent's tool_context map to inherit (optional).
+    Static, caller-supplied data (e.g., `user_id`, `current_scope`) that tools
+    access as flat top-level keys on context. Defaults to `%{}`.
+  - `:parent_metadata` - Parent's state metadata map to inherit (optional).
+    Dynamic, middleware-managed data (e.g., `conversation_title`) that tools
+    access via `context.state.metadata`. Defaults to `%{}`.
 
   ## Examples
 
@@ -175,54 +179,17 @@ defmodule Sagents.SubAgent do
         parent_agent_id: "main-agent",
         instructions: "Research renewable energy impacts",
         agent_config: agent_struct,
-        parent_state: parent_state
+        parent_tool_context: %{user_id: 42, tenant: "acme"},
+        parent_metadata: %{"conversation_title" => "Research"}
       )
   """
   def new_from_config(opts) do
-    parent_agent_id = Keyword.fetch!(opts, :parent_agent_id)
-    instructions = Keyword.fetch!(opts, :instructions)
     agent_config = Keyword.fetch!(opts, :agent_config)
+    instructions = Keyword.fetch!(opts, :instructions)
 
-    # Generate unique ID
-    sub_agent_id = "#{parent_agent_id}-sub-#{:erlang.unique_integer([:positive])}"
-
-    # Build the chain with system prompt + user message
     messages = build_initial_messages(agent_config.assembled_system_prompt, instructions)
 
-    # Create SubAgent's OWN state - fresh and independent from parent
-    # This ensures true isolation
-    subagent_state = State.new!(%{agent_id: sub_agent_id})
-
-    # Build custom_context with SubAgent's OWN state (not parent's!)
-    # Tools in SubAgent will access/modify SubAgent's state, not parent's
-    custom_context = %{
-      state: subagent_state,
-      parent_middleware: agent_config.middleware
-    }
-
-    chain =
-      LLMChain.new!(%{
-        llm: agent_config.model,
-        custom_context: custom_context
-      })
-      |> LLMChain.add_tools(agent_config.tools)
-      |> LLMChain.add_messages(messages)
-
-    # Extract interrupt_on configuration from agent_config middleware
-    interrupt_on = extract_interrupt_on_from_middleware(agent_config.middleware)
-
-    # Optional until_tool termination
-    until_tool = Keyword.get(opts, :until_tool)
-
-    %SubAgent{
-      id: sub_agent_id,
-      parent_agent_id: parent_agent_id,
-      chain: chain,
-      interrupt_on: interrupt_on,
-      until_tool: until_tool,
-      status: :idle,
-      created_at: DateTime.utc_now()
-    }
+    build_subagent(agent_config, messages, opts)
   end
 
   @doc """
@@ -236,8 +203,13 @@ defmodule Sagents.SubAgent do
   - `:parent_agent_id` - Parent's agent ID (required)
   - `:instructions` - Task description (required)
   - `:compiled_agent` - Pre-built Agent struct (required)
-  - `:parent_state` - Parent agent's current state (required)
   - `:initial_messages` - Optional initial message sequence (default: [])
+  - `:parent_tool_context` - Parent's tool_context map to inherit (optional).
+    Static, caller-supplied data (e.g., `user_id`, `current_scope`) that tools
+    access as flat top-level keys on context. Defaults to `%{}`.
+  - `:parent_metadata` - Parent's state metadata map to inherit (optional).
+    Dynamic, middleware-managed data (e.g., `conversation_title`) that tools
+    access via `context.state.metadata`. Defaults to `%{}`.
 
   ## Examples
 
@@ -245,48 +217,76 @@ defmodule Sagents.SubAgent do
         parent_agent_id: "main-agent",
         instructions: "Extract structured data",
         compiled_agent: data_extractor_agent,
-        parent_state: parent_state,
-        initial_messages: [prep_message]
+        initial_messages: [prep_message],
+        parent_tool_context: %{user_id: 42},
+        parent_metadata: %{"conversation_title" => "Extraction"}
       )
   """
   def new_from_compiled(opts) do
-    parent_agent_id = Keyword.fetch!(opts, :parent_agent_id)
-    instructions = Keyword.fetch!(opts, :instructions)
     compiled_agent = Keyword.fetch!(opts, :compiled_agent)
+    instructions = Keyword.fetch!(opts, :instructions)
     initial_messages = Keyword.get(opts, :initial_messages, [])
 
-    # Generate unique ID
-    sub_agent_id = "#{parent_agent_id}-sub-#{:erlang.unique_integer([:positive])}"
-
-    # Build chain with optional initial messages + instructions
     system_messages = build_initial_messages(compiled_agent.assembled_system_prompt, nil)
     user_message = Message.new_user!(instructions)
-    all_messages = system_messages ++ initial_messages ++ [user_message]
+    messages = system_messages ++ initial_messages ++ [user_message]
 
-    # Create SubAgent's OWN state - fresh and independent from parent
-    # This ensures true isolation and prevents memory waste from parent's message history
-    subagent_state = State.new!(%{agent_id: sub_agent_id})
+    build_subagent(compiled_agent, messages, opts)
+  end
 
-    # Build custom_context with SubAgent's OWN state (not parent's!)
-    # Tools in SubAgent will access/modify SubAgent's state, not parent's
-    custom_context = %{
-      state: subagent_state,
-      parent_middleware: compiled_agent.middleware
-    }
+  # Shared construction logic for all SubAgent creation paths.
+  #
+  # Given an Agent struct (from either Config or Compiled), the initial messages,
+  # and the caller's opts, builds the complete SubAgent with:
+  # - Fresh state inheriting parent's metadata snapshot
+  # - tool_context merged into custom_context (flat for tool access, preserved
+  #   as :tool_context key for nested SubAgent extraction)
+  # - Chain wired up with model, tools, and messages
+  #
+  # ## Context propagation
+  #
+  # Two context channels flow from parent to SubAgent:
+  # - `parent_tool_context`: static, caller-supplied data merged flat into
+  #   custom_context (e.g., user_id, current_scope). This is the sole source
+  #   of tool_context for SubAgents -- the Agent struct's own tool_context is
+  #   not used because pre-configured SubAgent Agents are built at init time
+  #   without access to the parent's runtime tool_context.
+  # - `parent_metadata`: dynamic, middleware-managed data copied into the
+  #   SubAgent's State.metadata (e.g., conversation_title)
+  #
+  # See docs/tool_context_and_state.md for full details.
+  defp build_subagent(agent, messages, opts) do
+    parent_agent_id = Keyword.fetch!(opts, :parent_agent_id)
+    parent_tool_context = Keyword.get(opts, :parent_tool_context, %{})
+    parent_metadata = Keyword.get(opts, :parent_metadata, %{})
+    until_tool = Keyword.get(opts, :until_tool)
+
+    sub_agent_id = "#{parent_agent_id}-sub-#{:erlang.unique_integer([:positive])}"
+
+    # SubAgent gets its own state but inherits parent's metadata snapshot.
+    subagent_state = State.new!(%{agent_id: sub_agent_id, metadata: parent_metadata})
+
+    # Merge parent_tool_context into custom_context (same pattern as
+    # Agent.build_chain). Internal keys always take precedence on collision.
+    custom_context =
+      parent_tool_context
+      |> Map.merge(%{
+        state: subagent_state,
+        parent_middleware: agent.middleware,
+        # Preserve the tool_context as an explicit key so nested SubAgents
+        # can extract it cleanly (same as Agent.build_chain).
+        tool_context: parent_tool_context
+      })
 
     chain =
       LLMChain.new!(%{
-        llm: compiled_agent.model,
+        llm: agent.model,
         custom_context: custom_context
       })
-      |> LLMChain.add_tools(compiled_agent.tools)
-      |> LLMChain.add_messages(all_messages)
+      |> LLMChain.add_tools(agent.tools)
+      |> LLMChain.add_messages(messages)
 
-    # Extract interrupt_on configuration from compiled_agent middleware
-    interrupt_on = extract_interrupt_on_from_middleware(compiled_agent.middleware)
-
-    # Optional until_tool termination
-    until_tool = Keyword.get(opts, :until_tool)
+    interrupt_on = extract_interrupt_on_from_middleware(agent.middleware)
 
     %SubAgent{
       id: sub_agent_id,
@@ -719,6 +719,10 @@ defmodule Sagents.SubAgent do
       field :name, :string
       field :description, :string
       field :system_prompt, :string
+      field :instructions, :string
+      field :system_prompt_override, :string
+      field :use_instructions, :string
+      field :display_text, :string
       field :tools, {:array, :any}, default: [], virtual: true
       field :model, :any, virtual: true
       field :middleware, {:array, :any}, default: [], virtual: true
@@ -729,7 +733,11 @@ defmodule Sagents.SubAgent do
     @type t :: %Config{
             name: String.t(),
             description: String.t(),
-            system_prompt: String.t(),
+            system_prompt: String.t() | nil,
+            instructions: String.t() | nil,
+            system_prompt_override: String.t() | nil,
+            use_instructions: String.t() | nil,
+            display_text: String.t() | nil,
             tools: [LangChain.Function.t()],
             model: term() | nil,
             middleware: list(),
@@ -743,18 +751,27 @@ defmodule Sagents.SubAgent do
         :name,
         :description,
         :system_prompt,
+        :instructions,
+        :system_prompt_override,
+        :use_instructions,
+        :display_text,
         :tools,
         :model,
         :middleware,
         :interrupt_on,
         :until_tool
       ])
-      |> validate_required([:name, :description, :system_prompt, :tools])
+      |> validate_required([:name, :description, :tools])
       |> validate_length(:name, min: 1, max: 100)
       |> validate_length(:description, min: 1, max: 500)
       |> validate_length(:system_prompt, min: 1, max: 10_000)
+      |> validate_length(:instructions, min: 1, max: 10_000)
+      |> validate_length(:system_prompt_override, min: 1, max: 10_000)
+      |> validate_length(:use_instructions, min: 1, max: 10_000)
+      |> validate_length(:display_text, min: 1, max: 200)
       |> validate_tools()
       |> validate_until_tool()
+      |> validate_prompt_source()
       |> apply_action(:insert)
     end
 
@@ -822,6 +839,29 @@ defmodule Sagents.SubAgent do
     end
 
     defp validate_tool_names_exist(changeset, _names, _tools), do: changeset
+
+    # At least one of system_prompt, instructions, or system_prompt_override
+    # must be present so the sub-agent has *some* task framing beyond the
+    # boilerplate.
+    defp validate_prompt_source(changeset) do
+      sources = [:system_prompt, :instructions, :system_prompt_override]
+      any_present? = Enum.any?(sources, &present?(get_field(changeset, &1)))
+
+      if any_present? do
+        changeset
+      else
+        add_error(
+          changeset,
+          :system_prompt,
+          "at least one of :system_prompt, :instructions, or :system_prompt_override must be set"
+        )
+      end
+    end
+
+    defp present?(nil), do: false
+    defp present?(""), do: false
+    defp present?(str) when is_binary(str), do: true
+    defp present?(_), do: false
   end
 
   defmodule Compiled do
@@ -837,6 +877,8 @@ defmodule Sagents.SubAgent do
     embedded_schema do
       field :name, :string
       field :description, :string
+      field :use_instructions, :string
+      field :display_text, :string
       field :agent, :any, virtual: true
       field :extract_result, :any, virtual: true
       field :initial_messages, {:array, :any}, default: [], virtual: true
@@ -845,6 +887,8 @@ defmodule Sagents.SubAgent do
     @type t :: %Compiled{
             name: String.t(),
             description: String.t(),
+            use_instructions: String.t() | nil,
+            display_text: String.t() | nil,
             agent: Sagents.Agent.t(),
             extract_result: (State.t() -> any()) | nil,
             initial_messages: [LangChain.Message.t()]
@@ -852,10 +896,20 @@ defmodule Sagents.SubAgent do
 
     def new(attrs) do
       %Compiled{}
-      |> cast(attrs, [:name, :description, :agent, :extract_result, :initial_messages])
+      |> cast(attrs, [
+        :name,
+        :description,
+        :use_instructions,
+        :display_text,
+        :agent,
+        :extract_result,
+        :initial_messages
+      ])
       |> validate_required([:name, :description, :agent])
       |> validate_length(:name, min: 1, max: 100)
       |> validate_length(:description, min: 1, max: 500)
+      |> validate_length(:use_instructions, min: 1, max: 10_000)
+      |> validate_length(:display_text, min: 1, max: 200)
       |> validate_agent()
       |> validate_extract_result()
       |> validate_initial_messages()
@@ -1033,6 +1087,42 @@ defmodule Sagents.SubAgent do
 
   ## Private Functions
 
+  # Universal framing for task-style sub-agents. Prepended to every Config-path
+  # sub-agent's system prompt so authors can focus on task specifics in
+  # `instructions`. Overridable via `system_prompt_override`.
+  @task_subagent_boilerplate """
+  You are a sub-agent invoked by to perform a specific, bounded task. You have access to tools. Focus on completing the task you've been given.
+
+  - You must complete the task and return a result, or fail and return a clear error. Do not stall.
+  - You cannot ask the user questions. There is no user in this conversation — only the instructions you've been given.
+  - Do not request clarification. Make the best decision with the information you have and report what you did.
+  - When finished, return a clear, concise result suitable for the parent agent to use.
+  """
+
+  @doc false
+  def task_subagent_boilerplate, do: @task_subagent_boilerplate
+
+  @doc """
+  Compose the child agent's `base_system_prompt` from a Config.
+
+  Composition rule:
+  - Header = `system_prompt_override` (if set) else the built-in boilerplate.
+  - Body = `instructions` (if set) else `system_prompt` (legacy) else "".
+
+  The header and body are joined with a blank line. Middleware-contributed
+  prompt fragments are appended later by the normal `Sagents.Agent` compile
+  path — this function does not handle those.
+  """
+  def compose_child_system_prompt(%Config{} = cfg) do
+    header = cfg.system_prompt_override || @task_subagent_boilerplate
+    body = cfg.instructions || cfg.system_prompt || ""
+
+    [header, body]
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.join("\n\n")
+  end
+
   defp configure_new_subagent(%Config{} = config, default_model, default_middleware) do
     # Use config's model or fall back to default
     model = config.model || default_model
@@ -1046,11 +1136,13 @@ defmodule Sagents.SubAgent do
     middleware =
       Sagents.Middleware.HumanInTheLoop.maybe_append(middleware, config.interrupt_on)
 
+    base_system_prompt = compose_child_system_prompt(config)
+
     # Create the agent with explicit middleware (replace defaults to avoid duplication)
     Sagents.Agent.new!(
       %{
         model: model,
-        base_system_prompt: config.system_prompt,
+        base_system_prompt: base_system_prompt,
         tools: config.tools,
         middleware: middleware
       },

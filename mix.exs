@@ -2,7 +2,7 @@ defmodule Sagents.MixProject do
   use Mix.Project
 
   @source_url "https://github.com/sagents-ai/sagents"
-  @version "0.4.4"
+  @version "0.6.0"
 
   def project do
     [
@@ -73,7 +73,7 @@ defmodule Sagents.MixProject do
         "compile --warnings-as-errors",
         "deps.unlock --unused",
         "format",
-        "test --include cluster"
+        "test --include cluster --include slow"
       ]
     ]
   end
@@ -106,6 +106,7 @@ defmodule Sagents.MixProject do
         ],
         SubAgents: [
           Sagents.SubAgent,
+          Sagents.SubAgent.Task,
           Sagents.SubAgentServer,
           Sagents.SubAgentsDynamicSupervisor
         ],
